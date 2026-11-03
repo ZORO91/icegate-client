@@ -205,7 +205,7 @@ own dependencies are unchanged. It does this, in order:
    unknown outcome stops the run with "do not re-run".
 5. **Draft and archive.** It writes the reply as HTML tables (eSANCHIT from the
    receipt, SB from an e-copy search of the last seven days by job number; the number can take a couple of minutes to appear,
-   so it re-checks every 30 s for up to `--wait` seconds, default 240, and Ctrl-C skips it), copies each
+   so it re-checks every 30 s for up to `--wait` seconds, default 600, and Ctrl-C skips it), copies each
    table to the clipboard as rich text the moment it exists (IRN/DRN first, then the SB table when it appears; paste in between) (`wl-copy` or `xclip` on Linux; macOS `osascript` and Windows PowerShell are in
    the code but untested), and moves the
    originals, signed files and drafts into `Done/<timestamp>/` inside the folder. That

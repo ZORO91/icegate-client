@@ -645,8 +645,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="show files and guessed codes only; sign and upload nothing")
     parser.add_argument("--yes", action="store_true", help="skip the upload confirmation (required when not on a terminal)")
     parser.add_argument("--no-sign", action="store_true", help="do not run the signer; use only files already signed")
-    parser.add_argument("--wait", type=float, default=240, metavar="SECONDS",
-                        help="how long to wait for SB numbers to appear for the reply draft (default 240)")
+    parser.add_argument("--wait", type=float, default=600, metavar="SECONDS",
+                        help="how long to wait for SB numbers to appear for the reply draft (default 600)")
     parser.add_argument("--signer", default=os.environ.get("ICEGATE_SIGN_SCRIPT") or Path(__file__).resolve().with_name("sign-all.py"))
     args = parser.parse_args(argv)
     say = lambda text: print(text, flush=True)  # noqa: E731
