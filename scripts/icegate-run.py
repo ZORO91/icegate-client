@@ -446,6 +446,17 @@ def esanchit_draft(receipt_path: Path, names: dict[str, str]) -> str:
     return esanchit_html(json.loads(receipt_path.read_text(encoding="utf-8")), names)
 
 
+def plain_table(text: str) -> str:
+    """The draft's tables as aligned plain text without borders, so a terminal selection pastes cleanly."""
+    out = []
+    for block in re.findall(r"<table.*?</table>", text, re.S):
+        rows = [[html.unescape(c) for c in re.findall(r"<t[hd]>(.*?)</t[hd]>", r, re.S)]
+                for r in re.findall(r"<tr>(.*?)</tr>", block, re.S)]
+        widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+        out.append("\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows))
+    return "\n\n".join(out)
+
+
 def pause_plain(say: Callable[[str], None]) -> Callable[[str, float], None]:
     def pause(message: str, seconds: float) -> None:
         say(message)
@@ -610,8 +621,10 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
     def share(name: str) -> None:
         """Put a finished draft on the clipboard now, so each table can be pasted as soon as it exists."""
         if name in drafts:
+            body = drafts[name].read_text(encoding="utf-8")
+            say(f"\n{plain_table(body)}\n")
             say(f"{name} table copied to clipboard as rich text; paste it into the reply"
-                if copy_html(drafts[name].read_text(encoding="utf-8"))
+                if copy_html(body)
                 else f"could not copy the {name} table; open {drafts[name]} in a browser, copy and paste")
 
     def wrap_up() -> None:

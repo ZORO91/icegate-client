@@ -94,10 +94,12 @@ def make(tmp_path, *names, signed=True):
 
 
 def fake_signer(tmp_path, code=0):
-    script = tmp_path / "signer.sh"
-    script.write_text('#!/bin/bash\nfor f in "$1"/*; do case "$f" in *_Signed.*) ;; *) t="${f%.*}_Signed.${f##*.}"; '
-                      f'cp "$f" "${{t// /_}}";; esac; done\nexit {code}\n')
-    script.chmod(0o700)
+    script = tmp_path / "signer.py"
+    script.write_text("import shutil, sys\nfrom pathlib import Path\n"
+                      "for f in Path(sys.argv[1]).iterdir():\n"
+                      "    if '_Signed.' not in f.name:\n"
+                      "        shutil.copy(f, f.with_name(f.stem.replace(' ', '_') + '_Signed' + f.suffix))\n"
+                      f"sys.exit({code})\n")
     return script
 
 
