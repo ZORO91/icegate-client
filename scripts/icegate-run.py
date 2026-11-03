@@ -607,15 +607,16 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         except (Stop, OSError, ValueError) as exc:
             say(f"note: {name} draft not created: {exc}")
 
+    def share(name: str) -> None:
+        """Put a finished draft on the clipboard now, so each table can be pasted as soon as it exists."""
+        if name in drafts:
+            say(f"{name} table copied to clipboard as rich text; paste it into the reply"
+                if copy_html(drafts[name].read_text(encoding="utf-8"))
+                else f"could not copy the {name} table; open {drafts[name]} in a browser, copy and paste")
+
     def wrap_up() -> None:
-        chosen = drafts.get("esanchit") or drafts.get("sb")
         if archive.exists():
             say(f"files and drafts are in {archive}; delete that folder when you are done")
-        if chosen:
-            say("copied to clipboard as rich text; paste it into the reply" if copy_html(chosen.read_text(encoding="utf-8"))
-                else f"could not copy to clipboard; open {chosen} in a browser, copy and paste")
-            if len(drafts) > 1:
-                say("a second draft is in the same folder; only the eSANCHIT draft is on the clipboard")
 
     try:
         for upload in uploads:
@@ -623,10 +624,12 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
             finish(upload)
             if upload.group == "eSANCHIT":
                 draft("esanchit", esanchit_draft, upload.receipt or STATE / "receipts" / f"{upload.plan_id}.json", known)
+                share("esanchit")
             else:
                 jobs = [m.group(0) for i in sbs if (m := re.match(r"\d+", i.signed.stem))]
                 if jobs:
                     draft("sb", sb_draft, run, location, jobs, stamp.date(), wait, ui.pause if ui else pause_plain(say))
+                    share("sb")
                 if len(jobs) != len(sbs) or any(i.signed.suffix.lower() == ".be" for i in filings):
                     say("note: no SB draft for .be files or SB files whose names do not start with the job number")
     except Stop as exc:
