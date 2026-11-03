@@ -422,3 +422,12 @@ def test_prepare_pdf_refuses_a_non_pdf(tmp_path, monkeypatch):
     path.write_bytes(b"not a pdf")
     with pytest.raises(mod.Stop, match="cannot be read"):
         mod.prepare_pdf(path, lambda _: None)
+
+
+def test_each_table_is_copied_as_soon_as_it_exists(tmp_path, monkeypatch):
+    copied = []
+    monkeypatch.setattr(mod, "copy_html", lambda text: copied.append(text) or True)
+    folder = make(tmp_path, "Commercial Invoice 1.pdf", "893.sb")
+    assert go(folder, tmp_path, FakeRun(tmp_path)) == 0
+    assert len(copied) == 2
+    assert "IRN and DRN" in copied[0] and "Shipping Bill Numbers" in copied[1]
