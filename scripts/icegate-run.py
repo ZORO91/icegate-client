@@ -43,10 +43,32 @@ FILING_SUFFIXES = {".sb", ".be"}
 _CHALLENGE = re.compile(r"^challenge\s+((?:SUBMIT|FILE) \d+ ([0-9a-f]{12}))\s*$", re.M)
 _RECEIPT = re.compile(r"^receipt\s+(\S.*?)\s*$", re.M)
 _SB_RECORD = re.compile(r"<TABLE>SB\r?\n\s*F\x1d([A-Za-z0-9]{4,10})\x1d")  # F, location, job number, date
-FLATTEN_DPI = 120  # 150 dpi pushes a 14-page invoice past the portal's 2 MiB per-file cap once signed
-FLAT_MARK = "icegate-run flattened"  # a flattened file is not flattened again
 PORTAL_FILE_CAP = 2 * 1024 * 1024
-SIGN_OVERHEAD_PER_PAGE = 13_000  # observed: 4 pages, 4 signatures added about 48 kB
+SIGN_OVERHEAD_PER_PAGE = 13_000  # observed: ~11.5 - 12 kB added per page by DSC signing
+SAFETY_MARGIN = 64 * 1024  # 64 kB safety buffer below 2 MiB cap
+FLATTEN_DPI = 120  # default dpi for short documents
+FLAT_MARK = "icegate-run flattened"  # a flattened file is not flattened again unless oversized
+
+# Profiles in descending order of visual quality.
+# Step down DPI and JPEG quality adaptively until the file fits within the safe cap.
+COMPRESSION_PROFILES: list[tuple[int, int]] = [
+    (120, 70),
+    (110, 70),
+    (100, 70),
+    (100, 60),
+    (90, 65),
+    (90, 55),
+    (85, 60),
+    (80, 60),
+    (80, 50),
+    (75, 55),
+    (72, 60),
+    (72, 50),
+    (72, 40),
+    (65, 40),
+    (60, 40),
+    (50, 40),
+]
 
 Runner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
 
@@ -433,16 +455,17 @@ def sb_location(path: Path) -> str | None:
     return match.group(1).upper() if (match := _SB_RECORD.search(head)) else None
 
 
-def flatten_pdf(source: Path, target: Path) -> None:
+def flatten_pdf(source: Path, target: Path, dpi: int = FLATTEN_DPI, quality: int = 70) -> int:
     """Rasterise every page to a grayscale JPEG. The portal rejects some Excel exports however they
     are rewritten (pikepdf, Ghostscript and PyMuPDF rebuilds all failed); a flat copy is accepted."""
     import pymupdf
     with pymupdf.open(source) as doc, pymupdf.open() as flat:
         for page in doc:
-            image = page.get_pixmap(dpi=FLATTEN_DPI, colorspace=pymupdf.csGRAY).tobytes("jpeg", jpg_quality=70)
+            image = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY).tobytes("jpeg", jpg_quality=quality)
             flat.new_page(width=page.rect.width, height=page.rect.height).insert_image(page.rect, stream=image)
         flat.set_metadata({"producer": FLAT_MARK})
         flat.save(target, garbage=4, deflate=True)
+    return target.stat().st_size
 
 
 def keep_original(path: Path) -> Path:
@@ -461,26 +484,54 @@ def keep_original(path: Path) -> Path:
 def prepare_pdf(path: Path, say: Callable[[str], None]) -> None:
     """Before signing, on every PDF: rasterise the pages (flatten_pdf). That makes any file the portal
     can parse, drops bytes glued on after %%EOF and turns existing signatures into plain page images.
-    The untouched original goes to FOLDER/.original/ first; a flat file is left alone on a rerun."""
+    The untouched original goes to FOLDER/.original/ first; if the file would exceed the portal's
+    2 MiB cap once signed, it is compressed adaptively (stepping down DPI/quality) until it fits safely."""
     import pymupdf
     try:
         with pymupdf.open(path) as doc:
-            if doc.metadata.get("producer") == FLAT_MARK:
-                return
             pages = len(doc)
+            is_flat = doc.metadata.get("producer") == FLAT_MARK
     except Exception as exc:
         raise Stop(f"{path.name} cannot be read as a PDF ({exc}); nothing was signed") from None
+
+    target_cap = PORTAL_FILE_CAP - (SIGN_OVERHEAD_PER_PAGE * pages) - SAFETY_MARGIN
+    if is_flat and path.stat().st_size <= target_cap:
+        return
+
+    if SIGN_OVERHEAD_PER_PAGE * pages >= PORTAL_FILE_CAP:
+        raise Stop(f"{path.name} has {pages} pages; signing overhead alone would exceed the portal's 2 MiB limit")
+
+    # Backup names can belong to an earlier document; never infer a match by name.
     kept = keep_original(path)
+    source = kept
+
+    effective_cap = max(1, target_cap)
     flat = path.with_name(f".{path.name}.flat")
+    best_size = None
+    best_profile = None
+
     try:
-        flatten_pdf(path, flat)
-        size = flat.stat().st_size
+        for dpi, quality in COMPRESSION_PROFILES:
+            size = flatten_pdf(source, flat, dpi=dpi, quality=quality)
+            best_size = size
+            best_profile = (dpi, quality)
+            if size <= effective_cap:
+                break
+
+        if best_size is None or best_size > effective_cap:
+            raise Stop(f"cannot compress {path.name} to the estimated safe size for signing; nothing was signed")
+
         flat.replace(path)
     finally:
         flat.unlink(missing_ok=True)
-    over = size + SIGN_OVERHEAD_PER_PAGE * pages > PORTAL_FILE_CAP
-    say(f"flattened {path.name} ({size // 1024} kB, original kept as {kept})"
-        + ("; warning: it may pass the portal's 2 MiB cap once signed" if over else ""))
+
+    dpi, quality = best_profile or (FLATTEN_DPI, 70)
+    if (dpi, quality) != (FLATTEN_DPI, 70):
+        say(f"compressed and flattened {path.name} ({best_size // 1024} kB at {dpi} dpi/q{quality}, "
+            f"{pages} pages, estimated signed {(best_size + SIGN_OVERHEAD_PER_PAGE * pages) // 1024} kB, "
+            f"original kept as {kept})")
+    else:
+        say(f"flattened {path.name} ({best_size // 1024} kB, original kept as {kept})")
 
 
 # ---------------------------------------------------------------- draft text
@@ -627,6 +678,7 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
     ledger = Ledger(state)
     originals = originals_by_signed_name(folder)
     tidy_names(folder, say, dry_run)
+
     source_hashes = {key: file_hash(path) for key, path in originals.items()}
     newly_signed = ledger.resumable(folder, originals, source_hashes)
     if (todo := unsigned(folder)):

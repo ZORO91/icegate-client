@@ -256,8 +256,10 @@ and receipt path; a filing 202 is not final, the filing-status email decides.
   nothing, but rasterising each page (120 dpi, grayscale JPEG, PyMuPDF) was accepted. A download with HTML glued
   on after `%%EOF` also broke the signer. So `prepare_pdf` flattens every unsigned PDF before signing: any old
   signature becomes part of the image, the unflattened original is kept in `FOLDER/.original/`, and a flat
-  file is not flattened again. Do not raise the dpi: a signed 14-page file must stay under the 2 MiB per-file
-  cap (a warning is printed when the estimate passes it). Flattening loses selectable text. A portal refusal
+  file is not flattened again unless its size exceeds the safe cap. If a multi-page document would exceed
+  the portal's 2 MiB per-file cap once signed, `prepare_pdf` adaptively compresses it (stepping down DPI and
+  JPEG quality) to leave an estimated allowance for signing; actual signed size can vary. If no profile fits,
+  preparation stops. Existing signed files are preserved. Flattening loses selectable text. A portal refusal
   stops the run like any other exit 1; there is no retry.
 - The script owns only: the prompts and tables (questionary and rich, declared in its own header, not
   client dependencies), choosing codes from `document_codes.txt` (the user picks per

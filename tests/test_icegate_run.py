@@ -550,3 +550,99 @@ def test_client_runner_forces_utf8_output(monkeypatch):
     mod.client_runner()(["esanchit", "doc-types", "invoice"])
     assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"
     assert seen["env"]["PYTHONUTF8"] == "1" and seen["env"]["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_prepare_pdf_compresses_when_default_dpi_exceeds_cap(tmp_path, monkeypatch):
+    import pymupdf
+    monkeypatch.undo()
+    path = tmp_path / "large.pdf"
+    with pymupdf.open() as doc:
+        for i in range(20):
+            page = doc.new_page(width=612, height=792)
+            for y in range(50, 750, 25):
+                page.insert_text((50, y), f"Sample text line {y} for page {i} of commercial document")
+        doc.save(path)
+    said = []
+    mod.prepare_pdf(path, said.append)
+    assert any("compressed and flattened" in s for s in said)
+    with pymupdf.open(path) as doc:
+        assert doc.metadata["producer"] == mod.FLAT_MARK
+        pages = len(doc)
+    assert path.stat().st_size + mod.SIGN_OVERHEAD_PER_PAGE * pages <= mod.PORTAL_FILE_CAP
+
+
+def test_prepare_pdf_recompresses_oversized_flat_file(tmp_path, monkeypatch):
+    import pymupdf
+    monkeypatch.undo()
+    path = tmp_path / "invoice.pdf"
+    with pymupdf.open() as doc:
+        for i in range(2):
+            page = doc.new_page(width=612, height=792)
+            page.insert_text((50, 50), f"Pristine original page {i}")
+        doc.save(path)
+    (tmp_path / ".original").mkdir()
+    original_bytes = path.read_bytes()
+    (tmp_path / ".original" / "invoice.pdf").write_bytes(original_bytes)
+    # Make path flat at 120 dpi
+    mod.flatten_pdf(path, path, dpi=120, quality=70)
+    # Set cap so 120 dpi is over cap, triggering recompression
+    monkeypatch.setattr(mod, "PORTAL_FILE_CAP", 40 * 1024)
+    monkeypatch.setattr(mod, "SIGN_OVERHEAD_PER_PAGE", 10 * 1024)
+    monkeypatch.setattr(mod, "SAFETY_MARGIN", 5 * 1024)
+    said = []
+    mod.prepare_pdf(path, said.append)
+    assert any("compressed and flattened" in s for s in said)
+    assert (tmp_path / ".original" / "invoice.pdf").read_bytes() == original_bytes
+
+
+def test_oversized_signed_file_is_not_deleted(tmp_path):
+    folder = tmp_path / "in"
+    folder.mkdir()
+    (folder / "invoice.pdf").write_text("unsigned original")
+    signed = folder / "invoice_Signed.pdf"
+    content = b"x" * (mod.PORTAL_FILE_CAP + 100)
+    signed.write_bytes(content)
+    try:
+        go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path), ui=None)
+    except mod.Stop:
+        pass
+    assert signed.read_bytes() == content
+
+
+def test_prepare_pdf_stops_if_no_profile_fits(tmp_path, monkeypatch):
+    import pymupdf
+    monkeypatch.undo()
+    path = tmp_path / "invoice.pdf"
+    with pymupdf.open() as doc:
+        doc.new_page()
+        doc.save(path)
+    original = path.read_bytes()
+    monkeypatch.setattr(mod, "PORTAL_FILE_CAP", 1000)
+    monkeypatch.setattr(mod, "SIGN_OVERHEAD_PER_PAGE", 100)
+    monkeypatch.setattr(mod, "SAFETY_MARGIN", 100)
+    monkeypatch.setattr(mod, "COMPRESSION_PROFILES", [(72, 40)])
+    with pytest.raises(mod.Stop, match="cannot compress"):
+        mod.prepare_pdf(path, lambda _: None)
+    assert path.read_bytes() == original
+
+
+def test_prepare_flat_pdf_does_not_use_unrelated_backup(tmp_path, monkeypatch):
+    import pymupdf
+    monkeypatch.undo()
+    path = tmp_path / "invoice.pdf"
+    with pymupdf.open() as doc:
+        doc.new_page()
+        doc.set_metadata({"producer": mod.FLAT_MARK})
+        doc.save(path)
+    backup = tmp_path / ".original"
+    backup.mkdir()
+    (backup / path.name).write_bytes(b"unrelated old file")
+    monkeypatch.setattr(mod, "PORTAL_FILE_CAP", 100000)
+    monkeypatch.setattr(mod, "SIGN_OVERHEAD_PER_PAGE", 1000)
+    monkeypatch.setattr(mod, "SAFETY_MARGIN", 1000)
+    # Force the flattened input over the estimated cap, while its rendered copy fits.
+    with path.open("ab") as out:
+        out.write(b"x" * 100000)
+    mod.prepare_pdf(path, lambda _: None)
+    with pymupdf.open(path) as doc:
+        assert len(doc) == 1
