@@ -19,6 +19,7 @@ ICEGATE_STATE_DIR, ICEGATE_SIGN_SCRIPT.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -191,25 +192,72 @@ class Prompts:
 
 # ---------------------------------------------------------------- ledger / scan / sign
 class Ledger:
-    """Signed files already uploaded, by name. A re-signed copy has new bytes, so the client's
-    own hash-based duplicate check cannot see a repeat; the name can."""
+    """Remember uploaded names and source hashes to detect repeats after re-signing."""
 
     def __init__(self, directory: Path) -> None:
         self.path = directory / "icegate-run-ledger.json"
+        self.pending_path = directory / "icegate-run-pending.json"
         try:
             self.entries: dict[str, dict] = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             self.entries = {}
         except (OSError, ValueError):
             raise Stop(f"cannot read {self.path}") from None
+        try:
+            self.pending: dict[str, dict] = json.loads(self.pending_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self.pending = {}
+        except (OSError, ValueError):
+            raise Stop(f"cannot read {self.pending_path}") from None
+
+    def remember_signed(self, folder: Path, paths: list[Path], source_hashes: dict[str, str]) -> None:
+        for path in paths:
+            key = signed_name(path).casefold()
+            signed = folder / signed_name(path)
+            self.pending[str(signed.resolve())] = {
+                "original": str(path.resolve()), "source_hash": source_hashes[key],
+                "prepared_hash": file_hash(path), "signed_hash": file_hash(signed),
+            }
+        self.pending_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp = tempfile.mkstemp(dir=self.pending_path.parent, prefix=".pending-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(self.pending, out, indent=1)
+            os.replace(tmp, self.pending_path)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+    def resumable(self, folder: Path, originals: dict[str, Path], source_hashes: dict[str, str]) -> set[str]:
+        result: set[str] = set()
+        for key, original in originals.items():
+            signed = folder / signed_name(original)
+            pending = self.pending.get(str(signed.resolve()))
+            previous = self.seen(signed)
+            if not pending or not signed.exists():
+                continue
+            if (signed.is_symlink() or not signed.is_file()
+                    or pending.get("original") != str(original.resolve())
+                    or pending.get("prepared_hash") != file_hash(original)
+                    or pending.get("signed_hash") != file_hash(signed)):
+                raise Stop(f"{original.name} or {signed.name} changed since signing; review the files before continuing")
+            if pending.get("source_hash") not in (previous or {}).get("source_hashes", []):
+                source_hashes[key] = pending["source_hash"]
+                result.add(key)
+        return result
 
     def seen(self, path: Path) -> dict | None:
         return self.entries.get(path.name.casefold())
 
-    def record(self, paths: list[Path], plan_id: str) -> None:
+    def record(self, items: list[Item], plan_id: str, source_hashes: dict[str, str]) -> None:
         now = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(timespec="seconds")
-        for path in paths:
-            self.entries[path.name.casefold()] = {"plan_id": plan_id, "at": now}
+        for item in items:
+            key = item.signed.name.casefold()
+            previous = self.entries.get(key, {})
+            hashes = previous.get("source_hashes", [])
+            source_hash = source_hashes.get(key)
+            if source_hash and source_hash not in hashes:
+                hashes = [*hashes, source_hash]
+            self.entries[key] = {"plan_id": plan_id, "at": now, "source_hashes": hashes}
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".ledger-")
         with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -226,6 +274,24 @@ def signed_name(path: Path) -> str:
     return portal_safe(path.stem + "_Signed" + path.suffix)
 
 
+def file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def originals_by_signed_name(folder: Path) -> dict[str, Path]:
+    originals: dict[str, Path] = {}
+    for path in folder.iterdir():
+        if (path.name.startswith(".") or path.is_symlink() or not path.is_file()
+                or path.suffix.lower() not in {".pdf", *FILING_SUFFIXES}
+                or path.stem.lower().endswith("_signed")):
+            continue
+        key = signed_name(path).casefold()
+        if key in originals:
+            raise Stop(f"{path.name} and {originals[key].name} have the same signed filename; rename one")
+        originals[key] = path
+    return originals
+
+
 def tidy_names(folder: Path, say: Callable[[str], None], dry_run: bool = False) -> None:
     """Give signed files portal-safe names (the signer only turns spaces into underscores)."""
     for path in sorted(folder.iterdir()):
@@ -237,13 +303,13 @@ def tidy_names(folder: Path, say: Callable[[str], None], dry_run: bool = False) 
             say(f"{'would rename' if dry_run else 'renamed'} {path.name} -> {safe} (the portal rejects some characters in file names)")
 
 
-def unsigned(folder: Path, ledger: Ledger) -> list[Path]:
-    """Originals with no signed twin yet (and not already uploaded)."""
+def unsigned(folder: Path) -> list[Path]:
+    """Originals with no signed twin yet."""
     names = {p.name for p in folder.iterdir()} | {portal_safe(p.name) for p in folder.iterdir()}
     return sorted(p for p in folder.iterdir()
                   if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
                   and p.suffix.lower() in {".pdf", *FILING_SUFFIXES} and not p.stem.lower().endswith("_signed")
-                  and signed_name(p) not in names and ledger.seen(Path(signed_name(p))) is None)
+                  and signed_name(p) not in names)
 
 
 def clean_env() -> dict[str, str]:
@@ -256,14 +322,36 @@ def sign_folder(folder: Path, signer: Path, say: Callable[[str], None]) -> None:
     say(f"signing with {signer.name} (the token must be plugged in)...")
     command = [sys.executable, str(signer)] if signer.suffix == ".py" else [str(signer)]
     try:
-        done = subprocess.run([*command, str(folder)], env={**clean_env(), "SIGN_ALL_IN_TERMINAL": "1"}, check=False)
+        done = subprocess.run([*command, str(folder)],
+                              env={**clean_env(), "SIGN_ALL_IN_TERMINAL": "1", "PYTHONUTF8": "1"},
+                              check=False)
     except OSError as exc:
         raise Stop(f"cannot run the signer: {exc.strerror}") from None
     if done.returncode:
         raise Stop(f"signing failed (exit {done.returncode}); nothing was uploaded")
 
 
-def scan(folder: Path, ledger: Ledger, say: Callable[[str], None]) -> tuple[list[Item], list[Item]]:
+def sign_batch(folder: Path, paths: list[Path], signer: Path, say: Callable[[str], None]) -> None:
+    """Give the folder-based signer only the files that need signing."""
+    with tempfile.TemporaryDirectory(prefix=".sign-batch-", dir=folder) as temp:
+        staging = Path(temp)
+        for path in paths:
+            shutil.copy2(path, staging / path.name)
+        sign_folder(staging, signer, say)
+        for path in paths:
+            produced = staging / (re.sub(r"\s+", "_", path.stem) + "_Signed" + path.suffix)
+            destination = folder / signed_name(path)
+            if not produced.is_file() or produced.is_symlink():
+                raise Stop(f"signer did not produce {destination.name}; nothing was uploaded")
+            if destination.exists():
+                raise Stop(f"{destination.name} already exists; nothing was overwritten")
+        for path in paths:
+            produced = staging / (re.sub(r"\s+", "_", path.stem) + "_Signed" + path.suffix)
+            shutil.move(str(produced), folder / signed_name(path))
+
+
+def scan(folder: Path, ledger: Ledger, say: Callable[[str], None],
+         newly_signed: set[str] | None = None) -> tuple[list[Item], list[Item]]:
     files = sorted(p for p in folder.iterdir() if not p.name.startswith(".") and not p.is_dir())
     originals = {signed_name(p): p for p in files if p.suffix.lower() in {".pdf", *FILING_SUFFIXES}
                  and not p.stem.lower().endswith("_signed")}
@@ -278,7 +366,7 @@ def scan(folder: Path, ledger: Ledger, say: Callable[[str], None]) -> tuple[list
         elif not path.stem.lower().endswith("_signed"):
             if signed_name(path) not in {q.name for q in files} | {portal_safe(q.name) for q in files}:
                 say(f"skipping {path.name} (not signed; sign it first)")
-        elif (done := ledger.seen(path)) is not None:
+        elif (done := ledger.seen(path)) is not None and path.name.casefold() not in (newly_signed or set()):
             say(f"skipping {path.name}: already uploaded (plan {done['plan_id']}, {done['at']}); "
                 "do not upload it again, move it out of this folder")
         else:
@@ -289,10 +377,12 @@ def scan(folder: Path, ledger: Ledger, say: Callable[[str], None]) -> tuple[list
 # ---------------------------------------------------------------- upload via the client
 def client_runner() -> Runner:
     extra = ["--state-dir", str(STATE)] if STATE_ENV else []
+    env = {**clean_env(), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
     def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["uv", "run", "--project", str(CLIENT), "icegate", *argv, *extra],
-                              capture_output=True, text=True, check=False, env=clean_env())
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              check=False, env=env)
     return run
 
 
@@ -480,20 +570,28 @@ def sb_draft(run: Runner, location: str, jobs: list[str], today: date, wait: flo
         raise Stop("stopped waiting for the SB number") from None
 
 
-def copy_html(text: str) -> bool:
-    """Put HTML on the clipboard as rich text; False when no tool worked.
-
-    Linux (wl-copy, xclip) is tested. macOS (osascript) and Windows (PowerShell) are not."""
+def clipboard_command(text: str) -> tuple[list[str], bytes | None] | None:
+    """The program that puts `text` on the clipboard as rich text, and the stdin it needs."""
     if sys.platform == "darwin":
-        argv, data = ["osascript", "-e", f"set the clipboard to \u00abdata HTML{text.encode().hex()}\u00bb"], None
-    elif sys.platform == "win32":
-        argv, data = ["powershell", "-NoProfile", "-Command", "$input | Out-String | Set-Clipboard -AsHtml"], text.encode()
-    else:
-        argv = next(([t, *a] for t, a in (("wl-copy", ["--type", "text/html"]),
-                                         ("xclip", ["-selection", "clipboard", "-t", "text/html"])) if shutil.which(t)), None)
-        data = text.encode()
-        if argv is None:
-            return False
+        return ["osascript", "-e", f"set the clipboard to \u00abdata HTML{text.encode().hex()}\u00bb"], None
+    if sys.platform == "win32":
+        # `$input` is pipeline input, not redirected stdin, so it pastes nothing. Read the bytes
+        # ourselves and decode them as UTF-8; Set-Clipboard -AsHtml then writes CF_HTML.
+        script = ("$stdin = [Console]::OpenStandardInput(); $buf = New-Object System.IO.MemoryStream; "
+                  "$stdin.CopyTo($buf); $html = [Text.Encoding]::UTF8.GetString($buf.ToArray()); "
+                  "Set-Clipboard -AsHtml -Value $html -ErrorAction Stop")
+        return ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], text.encode("utf-8")
+    argv = next(([t, *a] for t, a in (("wl-copy", ["--type", "text/html"]),
+                                     ("xclip", ["-selection", "clipboard", "-t", "text/html"])) if shutil.which(t)), None)
+    return (argv, text.encode()) if argv else None
+
+
+def copy_html(text: str) -> bool:
+    """Put HTML on the clipboard as rich text; False when no tool worked."""
+    command = clipboard_command(text)
+    if command is None:
+        return False
+    argv, data = command
     try:
         return subprocess.run(argv, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               check=False, timeout=30).returncode == 0
@@ -527,19 +625,31 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
     if done_dir.exists() and not done_dir.is_dir():
         raise Stop("'Done' exists and is not a folder")
     ledger = Ledger(state)
+    originals = originals_by_signed_name(folder)
     tidy_names(folder, say, dry_run)
-    if (todo := unsigned(folder, ledger)):
+    source_hashes = {key: file_hash(path) for key, path in originals.items()}
+    newly_signed = ledger.resumable(folder, originals, source_hashes)
+    if (todo := unsigned(folder)):
         if dry_run or signer is None:
             say(f"{len(todo)} unsigned file(s) would be skipped"
                 + (": " + ", ".join(p.name for p in todo) if len(todo) <= 5 else "")
                 + ("" if dry_run else "; no signer available, sign them first"))
         else:
             for path in todo:
+                key = signed_name(path).casefold()
+                previous = ledger.seen(Path(signed_name(path)))
+                if previous and source_hashes[key] in previous.get("source_hashes", []):
+                    raise Stop(f"{path.name} was already uploaded; move it out of this folder")
+                if previous and not previous.get("source_hashes"):
+                    say(f"warning: {path.name} has a previously uploaded name; older ledger entries "
+                        "cannot establish whether its contents were uploaded. Check the portal and mail.")
+            for path in todo:
                 if path.suffix.lower() == ".pdf":
                     prepare_pdf(path, say)
-            sign_folder(folder, signer, say)
-            tidy_names(folder, say)
-    pdfs, filings = scan(folder, ledger, say)
+            sign_batch(folder, todo, signer, say)
+            ledger.remember_signed(folder, todo, source_hashes)
+            newly_signed.update(signed_name(p).casefold() for p in todo)
+    pdfs, filings = scan(folder, ledger, say, newly_signed)
     if not pdfs and not filings:
         raise Stop("no new signed .pdf, .sb or .be files (names ending _Signed) to upload")
     if ui is not None and not dry_run and len(pdfs) + len(filings) > 1:
@@ -592,14 +702,14 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         raise Stop("interrupted before uploading; nothing was uploaded") from None
 
     stamp = datetime.now(ZoneInfo("Asia/Kolkata"))
-    archive = done_dir / stamp.strftime("%Y%m%d-%H%M%S")
+    archive = done_dir / stamp.strftime("%Y%m%d-%H%M%S-%f")
     drafts: dict[str, Path] = {}
     submitted: list[str] = []
 
     def finish(upload: Upload) -> None:
         """Record the upload, archive its files, then try the draft; never raises for after-work."""
         submitted.append(f"{upload.group} (plan {upload.plan_id})")
-        ledger.record([i.signed for i in upload.items], upload.plan_id)
+        ledger.record(upload.items, upload.plan_id, source_hashes)
         try:
             archive.mkdir(parents=True, exist_ok=True)
             for item in upload.items:

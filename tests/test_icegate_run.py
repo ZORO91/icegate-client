@@ -97,7 +97,7 @@ def fake_signer(tmp_path, code=0):
     script = tmp_path / "signer.py"
     script.write_text("import shutil, sys\nfrom pathlib import Path\n"
                       "for f in Path(sys.argv[1]).iterdir():\n"
-                      "    if '_Signed.' not in f.name:\n"
+                      "    if f.is_file() and '_Signed.' not in f.name:\n"
                       "        shutil.copy(f, f.with_name(f.stem.replace(' ', '_') + '_Signed' + f.suffix))\n"
                       f"sys.exit({code})\n")
     return script
@@ -433,3 +433,120 @@ def test_each_table_is_copied_as_soon_as_it_exists(tmp_path, monkeypatch):
     assert go(folder, tmp_path, FakeRun(tmp_path)) == 0
     assert len(copied) == 2
     assert "IRN and DRN" in copied[0] and "Shipping Bill Numbers" in copied[1]
+
+
+def test_new_original_with_previously_uploaded_name_is_signed(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice 1.pdf", signed=False)
+    go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path))
+    (folder / "Commercial Invoice 1.pdf").write_text("a different invoice")
+    run = FakeRun(tmp_path)
+    assert go(folder, tmp_path, run, signer=fake_signer(tmp_path)) == 0
+    assert any("--confirm" in call for call in run.calls)
+
+
+def test_same_original_is_not_signed_again_after_upload(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice 1.pdf", signed=False)
+    go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path))
+    (folder / "Commercial Invoice 1.pdf").write_text("Commercial Invoice 1.pdf")
+    run = FakeRun(tmp_path)
+    with pytest.raises(mod.Stop, match="already uploaded"):
+        go(folder, tmp_path, run, signer=fake_signer(tmp_path))
+    assert run.calls == []
+
+
+def test_new_same_name_can_resume_after_cancellation(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice 1.pdf", signed=False)
+    go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path))
+    (folder / "Commercial Invoice 1.pdf").write_text("a different invoice")
+    with pytest.raises(mod.Stop, match="not confirmed"):
+        go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path), ui=FakeUI(confirm=False))
+    run = FakeRun(tmp_path)
+    assert go(folder, tmp_path, run, signer=fake_signer(tmp_path)) == 0
+    assert any("--confirm" in call for call in run.calls)
+
+
+def test_changed_signed_file_cannot_use_pending_association(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice 1.pdf", signed=False)
+    go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path))
+    (folder / "Commercial Invoice 1.pdf").write_text("a different invoice")
+    with pytest.raises(mod.Stop, match="not confirmed"):
+        go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path), ui=FakeUI(confirm=False))
+    (folder / "Commercial_Invoice_1_Signed.pdf").write_text("different signed file")
+    run = FakeRun(tmp_path)
+    with pytest.raises(mod.Stop, match="changed since signing"):
+        go(folder, tmp_path, run, signer=fake_signer(tmp_path))
+    assert run.calls == []
+
+
+def test_changed_original_after_first_cancel_cannot_upload_old_signature(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice 1.pdf", signed=False)
+    with pytest.raises(mod.Stop, match="not confirmed"):
+        go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path), ui=FakeUI(confirm=False))
+    (folder / "Commercial Invoice 1.pdf").write_text("changed after signing")
+    run = FakeRun(tmp_path)
+    with pytest.raises(mod.Stop, match="changed since signing"):
+        go(folder, tmp_path, run, signer=fake_signer(tmp_path))
+    assert run.calls == []
+
+
+def test_colliding_original_names_stop_before_signing(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice.pdf", "Commercial_Invoice.pdf", signed=False)
+    run = FakeRun(tmp_path)
+    with pytest.raises(mod.Stop, match="same signed filename"):
+        go(folder, tmp_path, run, signer=fake_signer(tmp_path))
+    assert run.calls == []
+    assert not list(folder.glob("*_Signed.pdf"))
+
+
+def test_signing_another_file_does_not_replace_existing_signed_twin(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice.pdf")
+    signed = folder / "Commercial_Invoice_Signed.pdf"
+    signed.write_text("existing signature")
+    (folder / "Customs invoice.pdf").write_text("new")
+    with pytest.raises(mod.Stop, match="not confirmed"):
+        go(folder, tmp_path, FakeRun(tmp_path), signer=fake_signer(tmp_path), ui=FakeUI(confirm=False))
+    assert signed.read_text() == "existing signature"
+
+
+def test_windows_clipboard_reads_redirected_stdin(monkeypatch):
+    # `$input` is pipeline input, not stdin: the PowerShell branch pasted nothing before.
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(platform="win32"))
+    argv, data = mod.clipboard_command("<b>ümlaut & co</b>")
+    assert argv[:4] == ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+    assert "OpenStandardInput" in argv[-1] and "Set-Clipboard -AsHtml" in argv[-1]
+    assert data == "<b>ümlaut & co</b>".encode("utf-8")
+
+
+def test_copy_html_passes_the_draft_on_stdin(monkeypatch):
+    calls = []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.undo()  # the fixture replaces copy_html itself
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(mod.subprocess, "run", lambda argv, **kw: calls.append(kw) or Done())
+    assert mod.copy_html("<p>hi</p>") is True
+    assert calls[0]["input"] == b"<p>hi</p>"
+
+
+def test_copy_html_is_false_without_a_clipboard_tool(monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(mod.shutil, "which", lambda _: None)
+    assert mod.clipboard_command("<b>x</b>") is None
+    assert mod.copy_html("<b>x</b>") is False
+
+
+def test_client_runner_forces_utf8_output(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(mod, "STATE_ENV", None)
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    mod.client_runner()(["esanchit", "doc-types", "invoice"])
+    assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"
+    assert seen["env"]["PYTHONUTF8"] == "1" and seen["env"]["PYTHONIOENCODING"] == "utf-8"
