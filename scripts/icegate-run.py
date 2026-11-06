@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -43,6 +44,7 @@ FILING_SUFFIXES = {".sb", ".be"}
 _CHALLENGE = re.compile(r"^challenge\s+((?:SUBMIT|FILE) \d+ ([0-9a-f]{12}))\s*$", re.M)
 _RECEIPT = re.compile(r"^receipt\s+(\S.*?)\s*$", re.M)
 _SB_RECORD = re.compile(r"<TABLE>SB\r?\n\s*F\x1d([A-Za-z0-9]{4,10})\x1d")  # F, location, job number, date
+_SB_JOB = re.compile(r"<TABLE>SB\r?\n\s*F\x1d[A-Za-z0-9]{4,10}\x1d(\d+)\x1d(\d{8})\x1d")
 PORTAL_FILE_CAP = 2 * 1024 * 1024
 SIGN_OVERHEAD_PER_PAGE = 13_000  # observed: ~11.5 - 12 kB added per page by DSC signing
 SAFETY_MARGIN = 64 * 1024  # 64 kB safety buffer below 2 MiB cap
@@ -346,11 +348,14 @@ def sign_folder(folder: Path, signer: Path, say: Callable[[str], None]) -> None:
     try:
         done = subprocess.run([*command, str(folder)],
                               env={**clean_env(), "SIGN_ALL_IN_TERMINAL": "1", "PYTHONUTF8": "1"},
-                              check=False)
+                              capture_output=True, text=True, errors="replace", check=False)
     except OSError as exc:
         raise Stop(f"cannot run the signer: {exc.strerror}") from None
     if done.returncode:
+        if detail := (done.stderr or done.stdout).strip():
+            say(detail.replace(str(folder), "[signing folder]"))
         raise Stop(f"signing failed (exit {done.returncode}); nothing was uploaded")
+    say("Signing complete.")
 
 
 def sign_batch(folder: Path, paths: list[Path], signer: Path, say: Callable[[str], None]) -> None:
@@ -413,20 +418,22 @@ class Upload:
     group: str
     prefix: list[str]
     items: list[Item]
-    plan: str = ""
     challenge: str = ""
     plan_id: str = ""
     receipt: Path | None = None
 
 
-def plan_upload(run: Runner, group: str, prefix: list[str], items: list[Item]) -> Upload:
+def plan_upload(run: Runner, group: str, prefix: list[str], items: list[Item],
+                say: Callable[[str], None]) -> Upload:
     plan = run([*prefix, "--dry-run"])
     if plan.returncode:
         raise Stop(f"{group} plan failed:\n{plan.stdout}{plan.stderr}".rstrip())
     match = _CHALLENGE.search(plan.stdout)
     if not match:
         raise Stop(f"{group} plan printed no challenge")
-    return Upload(group, prefix, items, (plan.stdout + plan.stderr).rstrip(), match.group(1), match.group(2))
+    if plan.stderr.strip():
+        say(plan.stderr.strip())
+    return Upload(group, prefix, items, match.group(1), match.group(2))
 
 
 def send_upload(run: Runner, upload: Upload, say: Callable[[str], None]) -> None:
@@ -453,6 +460,20 @@ def sb_location(path: Path) -> str | None:
     except OSError:
         return None
     return match.group(1).upper() if (match := _SB_RECORD.search(head)) else None
+
+
+def sb_job(path: Path) -> tuple[str, str] | None:
+    try:
+        head = path.read_bytes()[:4096].decode("latin-1")
+    except OSError:
+        return None
+    if not (match := _SB_JOB.search(head)):
+        return None
+    try:
+        job_date = datetime.strptime(match.group(2), "%Y%m%d").date().isoformat()
+    except ValueError:
+        return None
+    return match.group(1), job_date
 
 
 def flatten_pdf(source: Path, target: Path, dpi: int = FLATTEN_DPI, quality: int = 70) -> int:
@@ -605,18 +626,20 @@ def pause_plain(say: Callable[[str], None]) -> Callable[[str, float], None]:
     return pause
 
 
-def sb_draft(run: Runner, location: str, jobs: list[str], today: date, wait: float,
+def sb_draft(run: Runner, location: str, jobs: list[tuple[str, str]], wait: float,
              pause: Callable[[str, float], None]) -> str:
     """The SB number can take a couple of minutes to appear after a filing; check until it does."""
     deadline = time.monotonic() + wait
     try:
         while True:
             try:
-                return sb_html(sb_rows(run, location, jobs, today))
+                return sb_html(sb_rows(run, location, jobs))
             except NotYet as exc:
                 if time.monotonic() >= deadline:
                     raise
-                pause(f"{exc}; checking again in {POLL_SECONDS}s (Ctrl-C to skip the SB draft)", POLL_SECONDS)
+                remaining = max(0, deadline - time.monotonic())
+                delay = min(POLL_SECONDS, remaining)
+                pause(f"{exc}; checking again in {delay:.0f}s (Ctrl-C to skip the SB draft)", delay)
     except KeyboardInterrupt:
         raise Stop("stopped waiting for the SB number") from None
 
@@ -650,21 +673,27 @@ def copy_html(text: str) -> bool:
         return False
 
 
-def sb_rows(run: Runner, location: str, jobs: list[str], today: date) -> list[dict]:
-    out = run(["ecopy", "search", "SB", "--from", str(today - timedelta(days=7)), "--to", str(today), "--json"])
-    if out.returncode:
-        raise Stop(f"SB search failed: {(out.stderr or out.stdout).strip()[:200]}")
-    try:
-        found = json.loads(out.stdout)
-    except ValueError:
-        raise Stop("SB search returned invalid JSON") from None
+def sb_rows(run: Runner, location: str, jobs: list[tuple[str, str]]) -> list[dict]:
     rows = []
-    for number in jobs:
+    for number, job_date in dict.fromkeys(jobs):
+        out = run(["ecopy", "search", "SB", "--location", location, "--job-number", number,
+                   "--job-date", job_date, "--json"])
+        if out.returncode:
+            raise Stop(f"SB search failed: {(out.stderr or out.stdout).strip()[:200]}")
+        try:
+            found = json.loads(out.stdout)
+        except ValueError:
+            raise Stop("SB search returned invalid JSON") from None
+        expected_date = date.fromisoformat(job_date).strftime("%d-%m-%Y")
         match = [r for r in found if str(r.get("jobNumber")) == number
-                 and str(r.get("location") or location).casefold() == location.casefold()]
+                 and str(r.get("location") or location).casefold() == location.casefold()
+                 and (not r.get("jobDate") or portal_date(r["jobDate"]) == expected_date)
+                 and r.get("docNumber") and r.get("docDate")]
         if not match:
             raise NotYet(f"no SB found yet for job {number}")
-        rows += match
+        if len(match) != 1:
+            raise Stop(f"multiple SB results for job {number}; check ICEGATE before drafting")
+        rows.extend(match)
     return rows
 
 
@@ -681,11 +710,12 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
 
     source_hashes = {key: file_hash(path) for key, path in originals.items()}
     newly_signed = ledger.resumable(folder, originals, source_hashes)
-    if (todo := unsigned(folder)):
-        if dry_run or signer is None:
+    todo = unsigned(folder)
+    if todo and not dry_run:
+        if signer is None:
             say(f"{len(todo)} unsigned file(s) would be skipped"
                 + (": " + ", ".join(p.name for p in todo) if len(todo) <= 5 else "")
-                + ("" if dry_run else "; no signer available, sign them first"))
+                + "; no signer available, sign them first")
         else:
             for path in todo:
                 key = signed_name(path).casefold()
@@ -701,7 +731,10 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
             sign_batch(folder, todo, signer, say)
             ledger.remember_signed(folder, todo, source_hashes)
             newly_signed.update(signed_name(p).casefold() for p in todo)
-    pdfs, filings = scan(folder, ledger, say, newly_signed)
+    pdfs, filings = scan(folder, ledger, (lambda message: None) if dry_run else say, newly_signed)
+    if dry_run:
+        for path in todo:
+            (pdfs if path.suffix.lower() == ".pdf" else filings).append(Item(path, path))
     if not pdfs and not filings:
         raise Stop("no new signed .pdf, .sb or .be files (names ending _Signed) to upload")
     if ui is not None and not dry_run and len(pdfs) + len(filings) > 1:
@@ -710,6 +743,7 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         if not pdfs and not filings:
             raise Stop("no files selected; nothing was uploaded")
     sbs = [i for i in filings if i.signed.suffix.lower() == ".sb"]
+    jobs = [job for i in sbs if (job := sb_job(i.signed))]
     location = None
     if sbs:
         found = {sb_location(i.signed) for i in sbs}
@@ -743,11 +777,13 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
     try:
         if pdfs:
             mapping = [f"--doc-type-map={i.signed.name}={i.code}" for i in pdfs]
-            uploads.append(plan_upload(run, "eSANCHIT", ["esanchit", "submit", *mapping, *(str(i.signed) for i in pdfs)], pdfs))
+            uploads.append(plan_upload(run, "eSANCHIT", ["esanchit", "submit", *mapping, *(str(i.signed) for i in pdfs)], pdfs, say))
         if filings:
-            uploads.append(plan_upload(run, "filing", ["filing", "upload", *(str(i.signed) for i in filings)], filings))
+            uploads.append(plan_upload(run, "filing", ["filing", "upload", *(str(i.signed) for i in filings)], filings, say))
         for upload in uploads:
-            say(f"\n== {upload.group} plan ==\n{upload.plan}")
+            say(f"{upload.group}: {len(upload.items)} file(s) validated and ready to upload.")
+            if upload.group == "filing":
+                say("Filing signatures were checked for structure; final DSC validation is done by ICEGATE.")
         if not yes and not ui.confirm(f"Upload {len(pdfs) + len(filings)} signed file(s) now? This cannot be undone."):
             raise Stop("not confirmed; nothing was uploaded")
     except KeyboardInterrupt:
@@ -775,8 +811,9 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         try:
             text = build(*args)
             archive.mkdir(parents=True, exist_ok=True)
-            drafts[name] = archive / f"draft-{name}.html"
-            drafts[name].write_text(text, encoding="utf-8")
+            path = archive / f"draft-{name}.html"
+            path.write_text(text, encoding="utf-8")
+            drafts[name] = path
         except (Stop, OSError, ValueError) as exc:
             say(f"note: {name} draft not created: {exc}")
 
@@ -801,16 +838,58 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
                 draft("esanchit", esanchit_draft, upload.receipt or STATE / "receipts" / f"{upload.plan_id}.json", known)
                 share("esanchit")
             else:
-                jobs = [m.group(0) for i in sbs if (m := re.match(r"\d+", i.signed.stem))]
                 if jobs:
-                    draft("sb", sb_draft, run, location, jobs, stamp.date(), wait, ui.pause if ui else pause_plain(say))
+                    say(f"Checking for SB numbers for job(s) {', '.join(n for n, _ in jobs)} for up to {wait:g} seconds. "
+                        "Press Ctrl-C to skip the wait; the upload is already complete.")
+                    draft("sb", sb_draft, run, location, jobs, wait, ui.pause if ui else pause_plain(say))
                     share("sb")
                 if len(jobs) != len(sbs) or any(i.signed.suffix.lower() == ".be" for i in filings):
-                    say("note: no SB draft for .be files or SB files whose names do not start with the job number")
+                    say("note: no SB draft for BE files or SB files without a readable job number in the SB record")
     except Stop as exc:
         wrap_up()
         raise Stop(f"{exc}\nAlready submitted in this run: {', '.join(submitted) or 'nothing'}") from None
     wrap_up()
+    return 0
+
+
+def recheck(folder: Path, *, run: Runner, say: Callable[[str], None], wait: float = 0,
+            table_name: str = "all") -> int:
+    """Restore saved tables or look up a missing SB number without signing or uploading."""
+    archive = folder
+    if (archive / "Done").is_dir():
+        raise Stop("provide the specific completed run folder inside Done")
+    say(f"Completed run: {archive}")
+    sb_path = archive / "draft-sb.html"
+    if table_name in ("all", "sb") and not sb_path.exists():
+        files = sorted(p for p in archive.iterdir() if p.is_file() and not p.is_symlink()
+                       and p.suffix.lower() == ".sb" and p.stem.lower().endswith("_signed"))
+        if files:
+            locations = {sb_location(p) for p in files}
+            jobs = [sb_job(p) for p in files]
+            if len(locations) != 1 or None in locations or None in jobs:
+                raise Stop("cannot read the location, job number and date from every archived SB file")
+            say(f"Looking up {len(jobs)} SB job(s); no files will be uploaded.")
+            try:
+                body = sb_draft(run, locations.pop(), jobs, wait, pause_plain(say))
+                sb_path.write_text(body, encoding="utf-8")
+            except (Stop, OSError, ValueError) as exc:
+                say(f"SB table unavailable: {exc}")
+    names = ("esanchit", "sb") if table_name == "all" else (table_name,)
+    shown = []
+    for name in names:
+        path = archive / f"draft-{name}.html"
+        if not path.is_file():
+            continue
+        body = path.read_text(encoding="utf-8")
+        say(f"\n{name.upper()} table:\n{plain_table(body)}")
+        shown.append((name, path, body))
+    if not shown:
+        raise Stop("no saved table is available for this run")
+    name, path, body = shown[-1]
+    say(f"{name.upper()} table copied to clipboard." if copy_html(body)
+        else f"Could not copy the {name.upper()} table; open {path} to copy it.")
+    if len(shown) > 1:
+        say("The clipboard holds the last table shown. Use --table esanchit or --table sb to copy either one.")
     return 0
 
 
@@ -820,19 +899,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="show files and guessed codes only; sign and upload nothing")
     parser.add_argument("--yes", action="store_true", help="skip the upload confirmation (required when not on a terminal)")
     parser.add_argument("--no-sign", action="store_true", help="do not run the signer; use only files already signed")
-    parser.add_argument("--wait", type=float, default=600, metavar="SECONDS",
-                        help="how long to wait for SB numbers to appear for the reply draft (default 600)")
+    parser.add_argument("--recheck", action="store_true", help="show tables from the specified completed run without uploading")
+    parser.add_argument("--table", choices=("all", "esanchit", "sb"), default="all", help="table to show and copy with --recheck")
+    parser.add_argument("--wait", type=float, default=None, metavar="SECONDS",
+                        help="wait for SB numbers (default: 600 seconds for upload, 0 for recheck)")
     parser.add_argument("--signer", default=os.environ.get("ICEGATE_SIGN_SCRIPT") or Path(__file__).resolve().with_name("sign-all.py"))
     args = parser.parse_args(argv)
     say = lambda text: print(text, flush=True)  # noqa: E731
     try:
+        if args.wait is not None and (not math.isfinite(args.wait) or args.wait < 0):
+            raise Stop("--wait must be a finite number of seconds, zero or greater")
         folder = Path(args.folder).expanduser().resolve()
         if not folder.is_dir():
             raise Stop("folder not found")
+        if args.recheck:
+            if args.dry_run or args.no_sign or args.yes:
+                raise Stop("--recheck cannot be combined with --dry-run, --no-sign or --yes")
+            return recheck(folder, run=client_runner(), say=say,
+                           wait=args.wait if args.wait is not None else 0, table_name=args.table)
+        if args.table != "all":
+            raise Stop("--table requires --recheck")
         signer = Path(args.signer).expanduser()
         return run_folder(folder, run=client_runner(), say=say,
                           ui=Prompts() if sys.stdin.isatty() else None, dry_run=args.dry_run, yes=args.yes,
-                          signer=None if args.no_sign or not signer.is_file() else signer, wait=args.wait)
+                          signer=None if args.no_sign or not signer.is_file() else signer,
+                          wait=args.wait if args.wait is not None else 600)
     except Stop as exc:
         print(f"stopped: {exc}", file=sys.stderr)
         return 1

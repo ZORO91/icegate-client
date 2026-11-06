@@ -269,6 +269,119 @@ def test_dry_run_prompts_for_nothing(tmp_path):
     assert not ui.codes and not ui.confirms and any("you will choose" in s for s in said)
 
 
+def test_dry_run_previews_unsigned_files_without_signing(tmp_path):
+    folder = make(tmp_path, "Commercial Invoice 1.pdf", "EXP-2627-762.sb", signed=False)
+    said, run = [], FakeRun(tmp_path)
+    assert go(folder, tmp_path, run, dry_run=True, said=said.append) == 0
+    output = "\n".join(said)
+    assert "Commercial Invoice 1.pdf" in output and "EXP-2627-762.sb" in output
+    assert "331000" not in output and "380000" in output
+    assert "nothing signed or uploaded" in output and not run.calls
+    assert not list(folder.glob("*_Signed.*"))
+
+
+def test_sb_job_is_read_from_file_when_filename_is_not_job_number(tmp_path):
+    folder = make(tmp_path, "EXP-2627-762.sb")
+    run, ui = LateSB(tmp_path), FakeUI()
+    assert go(folder, tmp_path, run, ui=ui, wait=600) == 0
+    assert run.searches == 3
+    assert (next((folder / "Done").iterdir()) / "draft-sb.html").exists()
+
+
+def test_sb_lookup_uses_job_date_and_rejects_incomplete_results(tmp_path):
+    run = FakeRun(tmp_path, rows=[{**SB_ROW, "docNumber": ""}])
+    with pytest.raises(mod.NotYet):
+        mod.sb_rows(run, "INMBD6", [("893", "2026-10-30")])
+    assert "--job-date" in run.calls[0] and "2026-10-30" in run.calls[0]
+
+
+def test_sb_lookup_rejects_wrong_job_date(tmp_path):
+    run = FakeRun(tmp_path, rows=[{**SB_ROW, "jobDate": "29-10-2026"}])
+    with pytest.raises(mod.NotYet):
+        mod.sb_rows(run, "INMBD6", [("893", "2026-10-30")])
+
+
+def test_recheck_recovers_sb_table_from_archived_file_without_upload(tmp_path, monkeypatch):
+    folder = make(tmp_path, "EXP-2627-762.sb")
+    run = FakeRun(tmp_path)
+    go(folder, tmp_path, run)
+    archive = next((folder / "Done").iterdir())
+    (archive / "draft-sb.html").unlink()
+    copied, said = [], []
+    monkeypatch.setattr(mod, "copy_html", lambda body: copied.append(body) or True)
+    run.calls.clear()
+    assert mod.recheck(archive, run=run, say=said.append, wait=0) == 0
+    assert "8176055" in "\n".join(said) and "8176055" in copied[0]
+    assert (archive / "draft-sb.html").exists()
+    assert all(call[:2] == ["ecopy", "search"] for call in run.calls)
+
+
+def test_recheck_can_copy_either_saved_table(tmp_path, monkeypatch):
+    archive = tmp_path / "Done" / "20261106-210750-330102"
+    archive.mkdir(parents=True)
+    (archive / "draft-esanchit.html").write_text(mod.esanchit_html(RECEIPT, NAMES))
+    (archive / "draft-sb.html").write_text(mod.sb_html([SB_ROW]))
+    copied, said = [], []
+    monkeypatch.setattr(mod, "copy_html", lambda body: copied.append(body) or True)
+    run = FakeRun(tmp_path)
+    assert mod.recheck(archive, run=run, say=said.append, wait=0, table_name="esanchit") == 0
+    assert "2026103000058483" in "\n".join(said) and len(copied) == 1
+    assert not run.calls
+
+
+def test_recheck_requires_specific_completed_run(tmp_path):
+    archive = tmp_path / "Done" / "20261106-210750-330102"
+    archive.mkdir(parents=True)
+    (archive / "draft-esanchit.html").write_text(mod.esanchit_html(RECEIPT, NAMES))
+    with pytest.raises(mod.Stop, match="completed run"):
+        mod.recheck(tmp_path, run=FakeRun(tmp_path), say=lambda _: None)
+
+
+def test_recheck_rejects_dry_run_option(tmp_path, capsys):
+    assert mod.main([str(tmp_path), "--recheck", "--dry-run"]) != 0
+    assert "--dry-run" in capsys.readouterr().err
+
+
+def test_failed_draft_write_does_not_crash_after_upload(tmp_path, monkeypatch):
+    folder = make(tmp_path, "Commercial Invoice 1.pdf")
+    write = Path.write_text
+    def fail_draft(path, *args, **kwargs):
+        if path.name == "draft-esanchit.html":
+            raise OSError("disk full")
+        return write(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "write_text", fail_draft)
+    said = []
+    assert go(folder, tmp_path, FakeRun(tmp_path), said=said.append) == 0
+    assert any("disk full" in message for message in said)
+
+
+def test_recheck_honors_explicit_wait(tmp_path, monkeypatch):
+    observed = []
+    monkeypatch.setattr(mod, "recheck", lambda folder, **kw: observed.append(kw["wait"]) or 0)
+    assert mod.main([str(tmp_path), "--recheck", "--wait", "45"]) == 0
+    assert observed == [45]
+
+
+@pytest.mark.parametrize("wait", ["-1", "nan", "inf"])
+def test_invalid_wait_stops_before_processing(tmp_path, wait, capsys):
+    assert mod.main([str(tmp_path), "--wait", wait]) == 1
+    assert "--wait" in capsys.readouterr().err
+
+
+def test_validation_warnings_are_shown_before_upload_confirmation(tmp_path):
+    class WarningRun(FakeRun):
+        def __call__(self, argv):
+            result = super().__call__(argv)
+            if "--dry-run" in argv:
+                result.stderr = "warning: signer trust is unverified\n"
+            return result
+    said = []
+    with pytest.raises(mod.Stop, match="not confirmed"):
+        go(make(tmp_path, "Commercial Invoice.pdf"), tmp_path, WarningRun(tmp_path),
+           ui=FakeUI(confirm=False), said=said.append)
+    assert any("signer trust is unverified" in message for message in said)
+
+
 def test_html_dates_and_refusals():
     out = mod.esanchit_html(RECEIPT, NAMES)
     assert "a&amp;b&lt;x&gt;.PDF" in out and "331000-Commercial" in out

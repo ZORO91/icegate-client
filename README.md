@@ -173,10 +173,13 @@ Workflow commands accept `--json`, `--env-file`, `--state-dir`,
 ## One command: sign, pick, confirm, upload
 
 ```bash
-scripts/icegate-run.py ~/Downloads/Files                          # Linux/macOS
-uv run scripts/icegate-run.py C:\Users\you\Files                  # Windows (no shebang)
-scripts\upload.cmd C:\Users\you\Files                             # Windows launcher
+upload "FILE_PATH"                         # Linux/macOS, if the upload command is installed
+scripts/icegate-run.py "FILE_PATH"          # Linux/macOS
+uv run scripts/icegate-run.py "FILE_PATH"   # Windows (no shebang)
+scripts\upload.cmd "FILE_PATH"              # Windows launcher
 ```
+
+Replace `FILE_PATH` with the path to your folder containing the files. The folder can be anywhere.
 
 A personal workflow around the client, not part of it. Both scripts are plain Python and
 system-neutral. The signer is separate: on Linux `icegate-sign` finds the vendor
@@ -210,20 +213,29 @@ own dependencies are unchanged. It does this, in order:
    "packing list" meaning 331000. `INV` and `PL` are read as invoice and packing
    list, so `INV&PL 123` gets 331000; `INV` alone only suggests candidates.
    Without a terminal it uses a code only when exactly one entry fits, otherwise stops.
-4. **Confirm.** It shows the client's upload plan (files, sizes, signature checks,
-   codes) and asks once; `--yes` skips the question and is needed when not on a
+4. **Confirm.** It shows the selected files, PDF document types and validation summary,
+   then asks once; `--yes` skips the question and is needed when not on a
    terminal. It then passes the plan's challenge to the client's `--confirm`. An
    unknown outcome stops the run with "do not re-run".
 5. **Draft and archive.** It writes the reply as HTML tables (eSANCHIT from the
-   receipt, SB from an e-copy search of the last seven days by job number; the number can take a couple of minutes to appear,
+   receipt, SB from an e-copy search using the location, job number and job date read from the SB file; the number can take a couple of minutes to appear,
    so it re-checks every 30 s for up to `--wait` seconds, default 600, and Ctrl-C skips it), copies each
    table to the clipboard as rich text the moment it exists (IRN/DRN first, then the SB table when it appears; paste in between) (`wl-copy` or `xclip` on Linux, Windows PowerShell; macOS `osascript` is
    in the code but untested), and moves the
    originals, signed files and drafts into `Done/<timestamp>/` inside the folder. That
    folder is created after every upload and is safe to delete.
 
+To show and copy tables from a completed run, use `upload "FILE_PATH" --recheck`,
+replacing `FILE_PATH` with that run's specific `Done/<timestamp>` folder, wherever it is located.
+If both tables exist, both are printed and the
+last is copied; use `--table esanchit` or `--table sb` to copy one specifically.
+If an SB table was not created, recheck makes one read-only lookup using the
+archived SB file. It never signs or uploads. BE filings have no SB table.
+Recheck performs one lookup by default; add `--wait 600` to wait up to ten minutes
+for a missing SB number. An existing saved table is displayed without a network lookup.
+
 For an `.sb` file the customs location is read from the file itself (the first field of its
-`<TABLE>SB` record); there is no option for it. If the files name different locations or none can be read, the run stops before anything is sent. `--dry-run` lists the files and guessed codes without signing or uploading. If a run
+`<TABLE>SB` record); there is no option for it. If the files name different locations or none can be read, the run stops before anything is sent. The SB lookup also uses the job number and date in that record, regardless of the filename. BE files are uploaded but do not have an SB-number draft. `--dry-run` lists signed and unsigned files and guessed codes without signing or uploading. If a run
 stops after an upload, check the portal and mail before trying again.
 
 | Piece | Owns | Never does |
