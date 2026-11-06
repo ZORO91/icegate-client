@@ -200,6 +200,18 @@ class Prompts:
     def confirm(self, text: str) -> bool:
         return self._answer(self.q.confirm(text, default=False))
 
+    def choose_run(self, runs: list[Path]) -> Path:
+        choices = []
+        for path in runs:
+            files = sorted(p.name for p in path.iterdir() if p.is_file()
+                           and p.suffix.lower() in {".pdf", *FILING_SUFFIXES}
+                           and p.stem.lower().endswith("_signed"))
+            summary = ", ".join(files[:2]) or "saved tables"
+            if len(files) > 2:
+                summary += f" (+{len(files) - 2} more)"
+            choices.append(self.q.Choice(f"{path.name}  |  {summary}", value=path))
+        return self._answer(self.q.select("Completed run to recheck (newest first)", choices=choices))
+
     def summary(self, rows: list[tuple[str, str, str]]) -> None:
         from rich.table import Table
         table = Table(title="eSANCHIT uploads", title_justify="left")
@@ -822,6 +834,7 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         if name in drafts:
             body = drafts[name].read_text(encoding="utf-8")
             say(f"\n{plain_table(body)}\n")
+            say("-" * 60)
             say(f"{name} table copied to clipboard as rich text; paste it into the reply"
                 if copy_html(body)
                 else f"could not copy the {name} table; open {drafts[name]} in a browser, copy and paste")
@@ -850,6 +863,15 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         raise Stop(f"{exc}\nAlready submitted in this run: {', '.join(submitted) or 'nothing'}") from None
     wrap_up()
     return 0
+
+
+def completed_runs(folder: Path) -> list[Path]:
+    history = folder / "Done" if (folder / "Done").is_dir() else folder
+    runs = sorted((p for p in history.iterdir() if p.is_dir() and not p.is_symlink()
+                   and re.fullmatch(r"\d{8}-\d{6}-\d{6}", p.name)), reverse=True)
+    if not runs:
+        raise Stop("no completed runs found; provide the working folder or its Done folder")
+    return runs
 
 
 def recheck(folder: Path, *, run: Runner, say: Callable[[str], None], wait: float = 0,
@@ -886,6 +908,7 @@ def recheck(folder: Path, *, run: Runner, say: Callable[[str], None], wait: floa
     if not shown:
         raise Stop("no saved table is available for this run")
     name, path, body = shown[-1]
+    say("-" * 60)
     say(f"{name.upper()} table copied to clipboard." if copy_html(body)
         else f"Could not copy the {name.upper()} table; open {path} to copy it.")
     if len(shown) > 1:
@@ -899,7 +922,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="show files and guessed codes only; sign and upload nothing")
     parser.add_argument("--yes", action="store_true", help="skip the upload confirmation (required when not on a terminal)")
     parser.add_argument("--no-sign", action="store_true", help="do not run the signer; use only files already signed")
-    parser.add_argument("--recheck", action="store_true", help="show tables from the specified completed run without uploading")
+    history_mode = parser.add_mutually_exclusive_group()
+    history_mode.add_argument("--recheck", action="store_true", help="show tables from the specified completed run without uploading")
+    history_mode.add_argument("--ls", action="store_true", help="pick a completed run from this folder's Done history and recheck it")
     parser.add_argument("--table", choices=("all", "esanchit", "sb"), default="all", help="table to show and copy with --recheck")
     parser.add_argument("--wait", type=float, default=None, metavar="SECONDS",
                         help="wait for SB numbers (default: 600 seconds for upload, 0 for recheck)")
@@ -912,13 +937,17 @@ def main(argv: list[str] | None = None) -> int:
         folder = Path(args.folder).expanduser().resolve()
         if not folder.is_dir():
             raise Stop("folder not found")
-        if args.recheck:
+        if args.recheck or args.ls:
             if args.dry_run or args.no_sign or args.yes:
-                raise Stop("--recheck cannot be combined with --dry-run, --no-sign or --yes")
+                raise Stop("--recheck/--ls cannot be combined with --dry-run, --no-sign or --yes")
+            if args.ls:
+                if not sys.stdin.isatty():
+                    raise Stop("--ls needs an interactive terminal; use FILE_PATH --recheck to select a run directly")
+                folder = Prompts().choose_run(completed_runs(folder))
             return recheck(folder, run=client_runner(), say=say,
                            wait=args.wait if args.wait is not None else 0, table_name=args.table)
         if args.table != "all":
-            raise Stop("--table requires --recheck")
+            raise Stop("--table requires --recheck or --ls")
         signer = Path(args.signer).expanduser()
         return run_folder(folder, run=client_runner(), say=say,
                           ui=Prompts() if sys.stdin.isatty() else None, dry_run=args.dry_run, yes=args.yes,

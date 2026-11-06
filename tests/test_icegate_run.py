@@ -337,6 +337,36 @@ def test_recheck_requires_specific_completed_run(tmp_path):
         mod.recheck(tmp_path, run=FakeRun(tmp_path), say=lambda _: None)
 
 
+def test_ls_picks_completed_run_and_only_rechecks_it(tmp_path, monkeypatch):
+    older = tmp_path / "Done" / "20261106-210414-972337"
+    newer = tmp_path / "Done" / "20261106-210750-330102"
+    for path in (older, newer):
+        path.mkdir(parents=True)
+        (path / "draft-sb.html").write_text(mod.sb_html([SB_ROW]))
+    (tmp_path / "Done" / "unrelated").mkdir()
+    class Picker:
+        def choose_run(self, runs):
+            assert runs == [newer, older]
+            return older
+    monkeypatch.setattr(mod.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(mod, "Prompts", Picker)
+    observed = []
+    monkeypatch.setattr(mod, "recheck", lambda path, **kw: observed.append(path) or 0)
+    assert mod.main([str(tmp_path), "--ls"]) == 0
+    assert observed == [older]
+
+
+def test_ls_accepts_done_directory_and_handles_empty_history(tmp_path):
+    done = tmp_path / "Done"
+    done.mkdir()
+    with pytest.raises(mod.Stop, match="completed runs"):
+        mod.completed_runs(done)
+    archive = done / "20261106-210750-330102"
+    archive.mkdir()
+    (archive / "sample_Signed.sb").write_text(SB_FILE)
+    assert mod.completed_runs(done) == [archive]
+
+
 def test_recheck_rejects_dry_run_option(tmp_path, capsys):
     assert mod.main([str(tmp_path), "--recheck", "--dry-run"]) != 0
     assert "--dry-run" in capsys.readouterr().err
@@ -697,7 +727,9 @@ def test_prepare_pdf_recompresses_oversized_flat_file(tmp_path, monkeypatch):
     original_bytes = path.read_bytes()
     (tmp_path / ".original" / "invoice.pdf").write_bytes(original_bytes)
     # Make path flat at 120 dpi
-    mod.flatten_pdf(path, path, dpi=120, quality=70)
+    flat = tmp_path / "flat.pdf"
+    mod.flatten_pdf(path, flat, dpi=120, quality=70)
+    flat.replace(path)  # replace only after the source document has closed (Windows)
     # Set cap so 120 dpi is over cap, triggering recompression
     monkeypatch.setattr(mod, "PORTAL_FILE_CAP", 40 * 1024)
     monkeypatch.setattr(mod, "SIGN_OVERHEAD_PER_PAGE", 10 * 1024)

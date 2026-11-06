@@ -234,6 +234,11 @@ archived SB file. It never signs or uploads. BE filings have no SB table.
 Recheck performs one lookup by default; add `--wait 600` to wait up to ten minutes
 for a missing SB number. An existing saved table is displayed without a network lookup.
 
+To choose a recent completed run interactively, use `upload "FILE_PATH" --ls`.
+Here `FILE_PATH` is the working folder or its `Done` folder. The picker lists runs
+newest first with their file names; selecting one rechecks it and copies the table.
+Use `--table sb` or `--table esanchit` to select which table to copy.
+
 For an `.sb` file the customs location is read from the file itself (the first field of its
 `<TABLE>SB` record); there is no option for it. If the files name different locations or none can be read, the run stops before anything is sent. The SB lookup also uses the job number and date in that record, regardless of the filename. BE files are uploaded but do not have an SB-number draft. `--dry-run` lists signed and unsigned files and guessed codes without signing or uploading. If a run
 stops after an upload, check the portal and mail before trying again.
