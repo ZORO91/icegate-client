@@ -20,6 +20,7 @@ from .ecopy import ECopyCache, ECopyClient
 from .enquiry import EnquiryClient
 from .jobstatus import JobStatusClient
 from .myiec import MyIecClient
+from .notifications import NotificationClient, filing_events
 from .esanchit.client import EsanchitClient
 from .esanchit.doc_types import DocumentCatalog
 from .esanchit.page import StagedRow, split_option
@@ -640,6 +641,13 @@ def cmd_report_job_status(ctx: Context, _args: argparse.Namespace | None = None)
     return 0
 
 
+def cmd_notifications(ctx: Context, _args: argparse.Namespace | None = None) -> int:
+    ctx.authenticate()
+    body = NotificationClient(ctx.session).list(ctx.args.type)
+    print(_json(filing_events(body) if ctx.args.events else body, indent=2))
+    return 0
+
+
 def cmd_my_iec(ctx: Context, _args: argparse.Namespace | None = None) -> int:
     ctx.authenticate()
     rows = MyIecClient(ctx.session).list(ctx.args.iec, ctx.args.location)
@@ -912,6 +920,12 @@ def build_parser() -> argparse.ArgumentParser:
     my_iec.add_argument("--iec", help="only this IEC code")
     my_iec.add_argument("--location", help="only this customs location code")
     my_iec.set_defaults(func=cmd_my_iec)
+
+    notifications = sub.add_parser("notifications", parents=[common], help="dashboard notifications (read-only, JSON)")
+    notifications.add_argument("--type", default="E", help="notification type (default E)")
+    notifications.add_argument("--events", action="store_true",
+                               help="only filing outcomes (submitted, rejected, validation failed), newest first")
+    notifications.set_defaults(func=cmd_notifications)
 
     enquiry = sub.add_parser("enquiry", help="public enquiries (no login)")
     enquiry_sub = enquiry.add_subparsers(dest="enquiry_command", required=True)

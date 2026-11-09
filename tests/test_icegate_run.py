@@ -20,6 +20,11 @@ RECEIPT = {"outcome": "submitted", "files": [{"name": "A&B<x>.pdf", "code": "331
 NAMES = {"331000": "Commercial invoice which includes a packing list"}
 SB_ROW = {"jobNumber": "893", "location": "INMBD6", "docNumber": "8176055", "docDate": "2026-10-28T00:00:00.000Z"}
 
+BE_FILE = "HREC\x1dZZ\x1dINHDD6\r\n<TABLE>BE\r\nF\x1dINHDD6\x1d113\x1d20261105\x1d\x1d\x1dH\x1d\r\n<END-BE>\r\n"
+BE_ROW = {"jobNumber": "113", "jobDate": "05-11-2026", "location": "INHDD6", "docNumber": "4941305", "docDate": "-"}
+REJECTED = {"outcome": "rejected", "doc": "BE", "job": "113", "date": "2026-11-05", "location": None,
+            "detail": "error code 820_SUPPDOCS", "message": "Your bill of entry filing with job no. 113 dated 05112026 has been rejected."}
+
 SB_FILE = "HREC\x1dZZ\x1dINMBD6\r\n<TABLE>SB\r\nF\x1dinmbd6\x1d893\x1d20261030\x1d\r\n<END-SB>\r\n"
 
 
@@ -33,8 +38,9 @@ def isolated(tmp_path, monkeypatch):
 class FakeRun:
     """Stands in for the client; every argv must parse with the client's real parser."""
 
-    def __init__(self, tmp_path, fail=None, fail_filing=False, rows=None):
+    def __init__(self, tmp_path, fail=None, fail_filing=False, rows=None, before=(), after=(), unreadable=0):
         self.calls, self.fail, self.fail_filing, self.rows, self.tmp = [], fail, fail_filing, rows, tmp_path
+        self.before, self.after, self.polled, self.unreadable = list(before), list(after), 0, unreadable
 
     def __call__(self, argv):
         self.calls.append(argv)
@@ -50,6 +56,11 @@ class FakeRun:
             if "--confirm" not in argv:
                 return ok("challenge   FILE 1 abcdefabcdef\n")
             return ok("", 1, "error: portal said no\n") if self.fail_filing else ok("accepted\n")
+        if argv[0] == "notifications":
+            self.polled += 1  # the first call is the baseline taken before uploading
+            if self.polled <= self.unreadable:
+                return ok("", 1, "boom")
+            return ok(json.dumps(self.before if self.polled == 1 else self.after + self.before))
         return ok(json.dumps(self.rows if self.rows is not None else [SB_ROW]))
 
 
@@ -86,7 +97,7 @@ def make(tmp_path, *names, signed=True):
     folder.mkdir()
     for name in names:
         stem, dot, ext = name.rpartition(".")
-        body = SB_FILE if ext == "sb" else name
+        body = SB_FILE if ext == "sb" else BE_FILE if ext == "be" else name
         (folder / name).write_text(body, newline="")
         if signed:
             (folder / (stem.replace(" ", "_") + "_Signed." + ext)).write_text("signed " + body, newline="")
@@ -313,7 +324,7 @@ def test_recheck_recovers_sb_table_from_archived_file_without_upload(tmp_path, m
     assert mod.recheck(archive, run=run, say=said.append, wait=0) == 0
     assert "8176055" in "\n".join(said) and "8176055" in copied[0]
     assert (archive / "draft-sb.html").exists()
-    assert all(call[:2] == ["ecopy", "search"] for call in run.calls)
+    assert all(call[:2] == ["ecopy", "search"] or call[0] == "notifications" for call in run.calls)
 
 
 def test_recheck_can_copy_either_saved_table(tmp_path, monkeypatch):
@@ -791,3 +802,46 @@ def test_prepare_flat_pdf_does_not_use_unrelated_backup(tmp_path, monkeypatch):
     mod.prepare_pdf(path, lambda _: None)
     with pymupdf.open(path) as doc:
         assert len(doc) == 1
+
+
+def test_be_number_is_looked_up_after_a_be_upload(tmp_path):
+    folder = make(tmp_path, "113.be")
+    run, said = FakeRun(tmp_path, rows=[BE_ROW]), []
+    assert go(folder, tmp_path, run, said=said.append) == 0
+    search = next(c for c in run.calls if c[:2] == ["ecopy", "search"])
+    assert search[2:] == ["BE", "--location", "INHDD6", "--job-number", "113", "--job-date", "2026-11-05", "--json"]
+    draft = (next((folder / "Done").iterdir()) / "draft-be.html").read_text()
+    assert "4941305" in draft and "BE Number" in draft and "SB Number" not in draft
+
+
+def test_a_rejection_notice_stops_the_wait_and_is_reported(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(mod.time, "sleep", sleeps.append)
+    folder = make(tmp_path, "113.be")
+    run, said = FakeRun(tmp_path, rows=[], after=[REJECTED]), []
+    with pytest.raises(mod.Stop) as stopped:
+        go(folder, tmp_path, run, ui=None, yes=True, wait=600, said=said.append)
+    assert sleeps == [] and "BE job 113" in str(stopped.value) and "820_SUPPDOCS" in str(stopped.value)
+    assert (next((folder / "Done").iterdir()) / "113_Signed.be").exists()  # the upload itself stays recorded
+
+
+def test_a_notice_from_before_the_upload_is_not_blamed_on_it(tmp_path):
+    folder = make(tmp_path, "113.be")
+    run = FakeRun(tmp_path, rows=[BE_ROW], before=[REJECTED])
+    assert go(folder, tmp_path, run) == 0
+
+
+def test_one_rejected_job_does_not_hide_the_others(tmp_path):
+    folder = make(tmp_path, "893.sb", "113.be")
+    run = FakeRun(tmp_path, rows=[SB_ROW], after=[REJECTED])
+    with pytest.raises(mod.Stop) as stopped:
+        go(folder, tmp_path, run)
+    assert "BE job 113" in str(stopped.value)
+    assert "8176055" in (next((folder / "Done").iterdir()) / "draft-sb.html").read_text()
+
+
+def test_unreadable_baseline_disables_rejection_reports_instead_of_guessing(tmp_path):
+    folder, said = make(tmp_path, "113.be"), []
+    run = FakeRun(tmp_path, rows=[BE_ROW], before=[REJECTED], unreadable=1)  # later reads would show an old rejection
+    assert go(folder, tmp_path, run, said=said.append) == 0
+    assert any("could not read ICEGATE notifications" in s for s in said)

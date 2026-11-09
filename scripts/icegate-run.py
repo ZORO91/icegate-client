@@ -43,8 +43,9 @@ STATE = Path(STATE_ENV or "~/.local/state/icegate-client").expanduser()
 FILING_SUFFIXES = {".sb", ".be"}
 _CHALLENGE = re.compile(r"^challenge\s+((?:SUBMIT|FILE) \d+ ([0-9a-f]{12}))\s*$", re.M)
 _RECEIPT = re.compile(r"^receipt\s+(\S.*?)\s*$", re.M)
-_SB_RECORD = re.compile(r"<TABLE>SB\r?\n\s*F\x1d([A-Za-z0-9]{4,10})\x1d")  # F, location, job number, date
-_SB_JOB = re.compile(r"<TABLE>SB\r?\n\s*F\x1d[A-Za-z0-9]{4,10}\x1d(\d+)\x1d(\d{8})\x1d")
+# The SB and BE records both start: F, location, job number, date.
+_RECORD = {kind: re.compile(rf"<TABLE>{kind}\r?\n\s*F\x1d([A-Za-z0-9]{{4,10}})\x1d") for kind in ("SB", "BE")}
+_JOB = {kind: re.compile(rf"<TABLE>{kind}\r?\n\s*F\x1d[A-Za-z0-9]{{4,10}}\x1d(\d+)\x1d(\d{{8}})\x1d") for kind in ("SB", "BE")}
 PORTAL_FILE_CAP = 2 * 1024 * 1024
 SIGN_OVERHEAD_PER_PAGE = 13_000  # observed: ~11.5 - 12 kB added per page by DSC signing
 SAFETY_MARGIN = 64 * 1024  # 64 kB safety buffer below 2 MiB cap
@@ -465,21 +466,21 @@ def send_upload(run: Runner, upload: Upload, say: Callable[[str], None]) -> None
         upload.receipt = Path(match.group(1)).expanduser()
 
 
-def sb_location(path: Path) -> str | None:
-    """The customs location the SB file itself names (first field of its SB record)."""
+def sb_location(path: Path, kind: str = "SB") -> str | None:
+    """The customs location the SB/BE file itself names (first field of its record)."""
     try:
         head = path.read_bytes()[:4096].decode("latin-1")
     except OSError:
         return None
-    return match.group(1).upper() if (match := _SB_RECORD.search(head)) else None
+    return match.group(1).upper() if (match := _RECORD[kind].search(head)) else None
 
 
-def sb_job(path: Path) -> tuple[str, str] | None:
+def sb_job(path: Path, kind: str = "SB") -> tuple[str, str] | None:
     try:
         head = path.read_bytes()[:4096].decode("latin-1")
     except OSError:
         return None
-    if not (match := _SB_JOB.search(head)):
+    if not (match := _JOB[kind].search(head)):
         return None
     try:
         job_date = datetime.strptime(match.group(2), "%Y%m%d").date().isoformat()
@@ -601,6 +602,14 @@ def sb_html(rows: list[dict]) -> str:
     return page("Find below Shipping Bill Numbers:", tables)
 
 
+def be_html(rows: list[dict]) -> str:
+    tables = [table(["Job No", "BE Number", "BE Date"],
+                    [[r.get("jobNumber", ""), r.get("docNumber", ""),
+                      "-" if r.get("docDate") in ("-", "") else portal_date(r["docDate"])]])
+              for r in rows]
+    return page("Find below Bill of Entry Numbers:", tables)
+
+
 def esanchit_html(receipt: dict, names: dict[str, str]) -> str:
     if receipt.get("outcome") != "submitted":
         raise Stop("receipt is not a confirmed submission; refusing to draft it")
@@ -638,22 +647,84 @@ def pause_plain(say: Callable[[str], None]) -> Callable[[str, float], None]:
     return pause
 
 
+Notices = Callable[[list[tuple[str, str]]], "dict[tuple[str, str], str]"]
+
+
 def sb_draft(run: Runner, location: str, jobs: list[tuple[str, str]], wait: float,
-             pause: Callable[[str, float], None]) -> str:
-    """The SB number can take a couple of minutes to appear after a filing; check until it does."""
+             pause: Callable[[str, float], None], *, kind: str = "SB",
+             notices: Notices | None = None, failures: dict[tuple[str, str], str] | None = None) -> str:
+    """The SB/BE number can take a couple of minutes to appear after a filing; check until it does.
+
+    `notices` maps jobs to a portal rejection message. A rejected job is dropped from the wait (it will
+    never get a number) and recorded in `failures`; when every job is rejected the draft is impossible.
+    """
+    failures = {} if failures is None else failures
+    build = be_html if kind == "BE" else sb_html
     deadline = time.monotonic() + wait
     try:
         while True:
+            if notices:
+                failures.update(notices([j for j in dict.fromkeys(jobs) if j not in failures]))
+            live = [j for j in jobs if j not in failures]
+            if not live:
+                raise Stop(f"no {kind} number will be issued: ICEGATE rejected every job")
             try:
-                return sb_html(sb_rows(run, location, jobs))
+                return build(sb_rows(run, location, live, kind))
             except NotYet as exc:
                 if time.monotonic() >= deadline:
                     raise
                 remaining = max(0, deadline - time.monotonic())
                 delay = min(POLL_SECONDS, remaining)
-                pause(f"{exc}; checking again in {delay:.0f}s (Ctrl-C to skip the SB draft)", delay)
+                pause(f"{exc}; checking again in {delay:.0f}s (Ctrl-C to skip the {kind} draft)", delay)
     except KeyboardInterrupt:
-        raise Stop("stopped waiting for the SB number") from None
+        raise Stop(f"stopped waiting for the {kind} number") from None
+
+
+def portal_events(run: Runner) -> list[dict] | None:
+    """Filing outcomes from the portal's notifications, newest first; None when they cannot be read."""
+    out = run(["notifications", "--events"])
+    if out.returncode:
+        return None
+    try:
+        events = json.loads(out.stdout)
+    except ValueError:
+        return None
+    return events if isinstance(events, list) else None
+
+
+def job_events(events: list[dict], location: str, job: tuple[str, str]) -> list[dict]:
+    number, job_date = job
+    return [e for e in events if e.get("job") == number and e.get("date") == job_date
+            and e.get("location") in (None, location.upper())]
+
+
+def notice_watcher(run: Runner, location: str, jobs: list[tuple[str, str]],
+                   say: Callable[[str], None], baseline: list[dict]) -> Notices:
+    """Report new portal outcomes for these jobs.
+
+    Notifications carry no time, so a job that was filed before (same number and date) is judged only by
+    what is not in `baseline`, the events fetched before uploading (empty: judge by everything).
+    """
+    seen = {job: len(job_events(baseline, location, job)) for job in dict.fromkeys(jobs)}
+    told: set[str] = set()
+
+    def check(live: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+        events = portal_events(run)
+        failed: dict[tuple[str, str], str] = {}
+        if events is None:  # unreadable now: say nothing rather than guess
+            return failed
+        for job in live:
+            matching = job_events(events, location, job)
+            for event in reversed(matching[:max(0, len(matching) - seen[job])]):  # new ones, oldest first
+                text = f"ICEGATE, job {job[0]}: {event['message']}"
+                if event["outcome"] == "submitted":
+                    if text not in told:
+                        told.add(text)
+                        say(text)
+                else:
+                    failed[job] = event["message"] + (f" ({event['detail']})" if event.get("detail") else "")
+        return failed
+    return check
 
 
 def clipboard_command(text: str) -> tuple[list[str], bytes | None] | None:
@@ -685,26 +756,26 @@ def copy_html(text: str) -> bool:
         return False
 
 
-def sb_rows(run: Runner, location: str, jobs: list[tuple[str, str]]) -> list[dict]:
+def sb_rows(run: Runner, location: str, jobs: list[tuple[str, str]], kind: str = "SB") -> list[dict]:
     rows = []
     for number, job_date in dict.fromkeys(jobs):
-        out = run(["ecopy", "search", "SB", "--location", location, "--job-number", number,
+        out = run(["ecopy", "search", kind, "--location", location, "--job-number", number,
                    "--job-date", job_date, "--json"])
         if out.returncode:
-            raise Stop(f"SB search failed: {(out.stderr or out.stdout).strip()[:200]}")
+            raise Stop(f"{kind} search failed: {(out.stderr or out.stdout).strip()[:200]}")
         try:
             found = json.loads(out.stdout)
         except ValueError:
-            raise Stop("SB search returned invalid JSON") from None
+            raise Stop(f"{kind} search returned invalid JSON") from None
         expected_date = date.fromisoformat(job_date).strftime("%d-%m-%Y")
         match = [r for r in found if str(r.get("jobNumber")) == number
                  and str(r.get("location") or location).casefold() == location.casefold()
                  and (not r.get("jobDate") or portal_date(r["jobDate"]) == expected_date)
                  and r.get("docNumber") and r.get("docDate")]
         if not match:
-            raise NotYet(f"no SB found yet for job {number}")
+            raise NotYet(f"no {kind} found yet for job {number}")
         if len(match) != 1:
-            raise Stop(f"multiple SB results for job {number}; check ICEGATE before drafting")
+            raise Stop(f"multiple {kind} results for job {number}; check ICEGATE before drafting")
         rows.extend(match)
     return rows
 
@@ -754,16 +825,20 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         pdfs, filings = [i for i in pdfs if i.signed.name in names], [i for i in filings if i.signed.name in names]
         if not pdfs and not filings:
             raise Stop("no files selected; nothing was uploaded")
-    sbs = [i for i in filings if i.signed.suffix.lower() == ".sb"]
-    jobs = [job for i in sbs if (job := sb_job(i.signed))]
-    location = None
-    if sbs:
-        found = {sb_location(i.signed) for i in sbs}
-        if len(found) != 1 or None in found:
+    # Per kind: the files, their (job, date) pairs and the one customs location they name.
+    numbered: dict[str, tuple[list[Item], list[tuple[str, str]], str | None]] = {}
+    for kind in ("SB", "BE"):
+        group = [i for i in filings if i.signed.suffix.lower() == f".{kind.lower()}"]
+        if not group:
+            continue
+        found = {sb_location(i.signed, kind) for i in group}
+        if kind == "SB" and (len(found) != 1 or None in found):
             raise Stop("cannot read one customs location from the SB file(s); each must name the same one "
                        "in its <TABLE>SB record")
-        location = found.pop()
-        say(f"location {location} (read from the SB file)")
+        location = found.pop() if len(found) == 1 and None not in found else None
+        if location:
+            say(f"location {location} (read from the {kind} file)")
+        numbered[kind] = (group, [job for i in group if (job := sb_job(i.signed, kind))], location)
     known = catalog()
     if dry_run:
         for item in pdfs:
@@ -805,6 +880,15 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
     archive = done_dir / stamp.strftime("%Y%m%d-%H%M%S-%f")
     drafts: dict[str, Path] = {}
     submitted: list[str] = []
+    rejected: list[str] = []
+    failures: dict[str, dict[tuple[str, str], str]] = {"SB": {}, "BE": {}}
+    # Notifications carry no time, so remember what the portal already said about these jobs before uploading.
+    checked = any(jobs and location for _, jobs, location in numbered.values())
+    before = portal_events(run) if checked else None
+    if checked and before is None:
+        say("note: could not read ICEGATE notifications; rejections will not be reported here, so watch your mail")
+    watchers: dict[str, Notices | None] = {kind: notice_watcher(run, location, jobs, say, before) if before is not None else None
+                                           for kind, (_, jobs, location) in numbered.items() if jobs and location}
 
     def finish(upload: Upload) -> None:
         """Record the upload, archive its files, then try the draft; never raises for after-work."""
@@ -819,15 +903,15 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
         except OSError as exc:
             say(f"warning: uploaded, but could not archive some files ({exc.strerror}); they are still in the folder")
 
-    def draft(name: str, build: Callable[..., str], *args: object) -> None:
+    def draft(name: str, build: Callable[..., str], *args: object, **kwargs: object) -> None:
         try:
-            text = build(*args)
+            text = build(*args, **kwargs)
             archive.mkdir(parents=True, exist_ok=True)
             path = archive / f"draft-{name}.html"
             path.write_text(text, encoding="utf-8")
             drafts[name] = path
         except (Stop, OSError, ValueError) as exc:
-            say(f"note: {name} draft not created: {exc}")
+            say(f"note: {name.upper()} table not created: {exc}")
 
     def share(name: str) -> None:
         """Put a finished draft on the clipboard now, so each table can be pasted as soon as it exists."""
@@ -851,17 +935,27 @@ def run_folder(folder: Path, *, run: Runner, say: Callable[[str], None],
                 draft("esanchit", esanchit_draft, upload.receipt or STATE / "receipts" / f"{upload.plan_id}.json", known)
                 share("esanchit")
             else:
-                if jobs:
-                    say(f"Checking for SB numbers for job(s) {', '.join(n for n, _ in jobs)} for up to {wait:g} seconds. "
+                for kind, (group, jobs, location) in numbered.items():
+                    if not jobs or not location or len(jobs) != len(group):
+                        say(f"note: no {kind} number check for {kind} files without a readable location and job "
+                            f"number in the {kind} record; look them up in ICEGATE")
+                    if not jobs or not location:
+                        continue
+                    say(f"Checking for {kind} numbers for job(s) {', '.join(n for n, _ in jobs)} for up to {wait:g} seconds. "
                         "Press Ctrl-C to skip the wait; the upload is already complete.")
-                    draft("sb", sb_draft, run, location, jobs, wait, ui.pause if ui else pause_plain(say))
-                    share("sb")
-                if len(jobs) != len(sbs) or any(i.signed.suffix.lower() == ".be" for i in filings):
-                    say("note: no SB draft for BE files or SB files without a readable job number in the SB record")
+                    name = kind.lower()
+                    draft(name, sb_draft, run, location, jobs, wait, ui.pause if ui else pause_plain(say),
+                          kind=kind, notices=watchers[kind], failures=failures[kind])
+                    share(name)
+                    for (number, _), message in failures[kind].items():
+                        rejected.append(f"{kind} job {number}: {message}")
     except Stop as exc:
         wrap_up()
         raise Stop(f"{exc}\nAlready submitted in this run: {', '.join(submitted) or 'nothing'}") from None
     wrap_up()
+    if rejected:
+        raise Stop("ICEGATE reported a problem with the upload; fix the file and file it again only after "
+                   "checking the portal:\n  " + "\n  ".join(rejected))
     return 0
 
 
@@ -881,22 +975,31 @@ def recheck(folder: Path, *, run: Runner, say: Callable[[str], None], wait: floa
     if (archive / "Done").is_dir():
         raise Stop("provide the specific completed run folder inside Done")
     say(f"Completed run: {archive}")
-    sb_path = archive / "draft-sb.html"
-    if table_name in ("all", "sb") and not sb_path.exists():
+    for kind in ("SB", "BE"):
+        name = kind.lower()
+        path = archive / f"draft-{name}.html"
+        if table_name not in ("all", name) or path.exists():
+            continue
         files = sorted(p for p in archive.iterdir() if p.is_file() and not p.is_symlink()
-                       and p.suffix.lower() == ".sb" and p.stem.lower().endswith("_signed"))
-        if files:
-            locations = {sb_location(p) for p in files}
-            jobs = [sb_job(p) for p in files]
-            if len(locations) != 1 or None in locations or None in jobs:
-                raise Stop("cannot read the location, job number and date from every archived SB file")
-            say(f"Looking up {len(jobs)} SB job(s); no files will be uploaded.")
-            try:
-                body = sb_draft(run, locations.pop(), jobs, wait, pause_plain(say))
-                sb_path.write_text(body, encoding="utf-8")
-            except (Stop, OSError, ValueError) as exc:
-                say(f"SB table unavailable: {exc}")
-    names = ("esanchit", "sb") if table_name == "all" else (table_name,)
+                       and p.suffix.lower() == f".{name}" and p.stem.lower().endswith("_signed"))
+        if not files:
+            continue
+        locations = {sb_location(p, kind) for p in files}
+        jobs = [sb_job(p, kind) for p in files]
+        if len(locations) != 1 or None in locations or None in jobs:
+            raise Stop(f"cannot read the location, job number and date from every archived {kind} file")
+        location = locations.pop()
+        say(f"Looking up {len(jobs)} {kind} job(s); no files will be uploaded.")
+        failed: dict[tuple[str, str], str] = {}
+        try:
+            body = sb_draft(run, location, jobs, wait, pause_plain(say), kind=kind, failures=failed,
+                            notices=notice_watcher(run, location, jobs, say, []))
+            path.write_text(body, encoding="utf-8")
+        except (Stop, OSError, ValueError) as exc:
+            say(f"{kind} table unavailable: {exc}")
+        for (number, _), message in failed.items():
+            say(f"{kind} job {number}: {message}")
+    names = ("esanchit", "sb", "be") if table_name == "all" else (table_name,)
     shown = []
     for name in names:
         path = archive / f"draft-{name}.html"
@@ -912,7 +1015,7 @@ def recheck(folder: Path, *, run: Runner, say: Callable[[str], None], wait: floa
     say(f"{name.upper()} table copied to clipboard." if copy_html(body)
         else f"Could not copy the {name.upper()} table; open {path} to copy it.")
     if len(shown) > 1:
-        say("The clipboard holds the last table shown. Use --table esanchit or --table sb to copy either one.")
+        say("The clipboard holds the last table shown. Use --table esanchit, sb or be to copy one.")
     return 0
 
 
@@ -925,7 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
     history_mode = parser.add_mutually_exclusive_group()
     history_mode.add_argument("--recheck", action="store_true", help="show tables from the specified completed run without uploading")
     history_mode.add_argument("--ls", action="store_true", help="pick a completed run from this folder's Done history and recheck it")
-    parser.add_argument("--table", choices=("all", "esanchit", "sb"), default="all", help="table to show and copy with --recheck")
+    parser.add_argument("--table", choices=("all", "esanchit", "sb", "be"), default="all", help="table to show and copy with --recheck")
     parser.add_argument("--wait", type=float, default=None, metavar="SECONDS",
                         help="wait for SB numbers (default: 600 seconds for upload, 0 for recheck)")
     parser.add_argument("--signer", default=os.environ.get("ICEGATE_SIGN_SCRIPT") or Path(__file__).resolve().with_name("sign-all.py"))

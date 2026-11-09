@@ -97,6 +97,7 @@ icegate ecopy download --irn <irn> -o signed-copy.pdf
 icegate ecopy search GATEPASS --from 2026-10-27 --to 2026-10-27 --json   # SB35 gatepass records
 icegate report job-status --json                  # latest ~200 bills, every column
 icegate my-iec --json                             # all IEC clients
+icegate notifications --events                    # filing outcomes: submitted, rejected, validation failed
 icegate enquiry sb --location INMBD6 --sb-no 6817710 --sb-date 2026-09-14 --json   # public, no login
 ```
 
@@ -121,6 +122,11 @@ SB and BE signed PDF downloads succeeded. The acknowledgement endpoint
 returned HTTP 409 for six sampled files; availability remains uncertain. A signed
 download answering 409 means the portal is still retrieving an older document;
 retry in about an hour. Gatepass records without an `irn` have no gatepass yet.
+
+`notifications` reads the dashboard bell (read-only; it never marks anything read). Plain, it
+prints the raw list; with `--events` it prints only filing outcomes, newest first, as JSON
+(`outcome` is `submitted`, `rejected` or `failed`, with `job`, `date`, `location` and `detail`).
+`submitted` means accepted for processing, not final. Notifications have a date but no time.
 
 `report job-status` prints the portal's latest ~200 Shipping Bills (no date
 filter), `my-iec` lists your IEC clients, and `enquiry sb` reads the public
@@ -218,9 +224,9 @@ own dependencies are unchanged. It does this, in order:
    terminal. It then passes the plan's challenge to the client's `--confirm`. An
    unknown outcome stops the run with "do not re-run".
 5. **Draft and archive.** It writes the reply as HTML tables (eSANCHIT from the
-   receipt, SB from an e-copy search using the location, job number and job date read from the SB file; the number can take a couple of minutes to appear,
-   so it re-checks every 30 s for up to `--wait` seconds, default 600, and Ctrl-C skips it), copies each
-   table to the clipboard as rich text the moment it exists (IRN/DRN first, then the SB table when it appears; paste in between) (`wl-copy` or `xclip` on Linux, Windows PowerShell; macOS `osascript` is
+   receipt, SB and BE from an e-copy search using the location, job number and job date read from the SB or BE file; the number can take a couple of minutes to appear,
+   so it re-checks every 30 s for up to `--wait` seconds, default 600, and Ctrl-C skips it. Each check also reads ICEGATE's notifications: a rejection or validation failure for that job ends its wait at once, prints the portal's message and error code, and the run exits with an error after the other tables are made. Only notices that appear after the upload count, because job numbers repeat), copies each
+   table to the clipboard as rich text the moment it exists (IRN/DRN first, then the SB and BE tables when they appear; paste in between) (`wl-copy` or `xclip` on Linux, Windows PowerShell; macOS `osascript` is
    in the code but untested), and moves the
    originals, signed files and drafts into `Done/<timestamp>/` inside the folder. That
    folder is created after every upload and is safe to delete.
@@ -228,19 +234,19 @@ own dependencies are unchanged. It does this, in order:
 To show and copy tables from a completed run, use `upload "FILE_PATH" --recheck`,
 replacing `FILE_PATH` with that run's specific `Done/<timestamp>` folder, wherever it is located.
 If both tables exist, both are printed and the
-last is copied; use `--table esanchit` or `--table sb` to copy one specifically.
-If an SB table was not created, recheck makes one read-only lookup using the
-archived SB file. It never signs or uploads. BE filings have no SB table.
+last is copied; use `--table esanchit`, `--table sb` or `--table be` to copy one specifically.
+If an SB or BE table was not created, recheck makes one read-only lookup using the
+archived file, and reports any rejection the portal's notifications hold for that job. It never signs or uploads.
 Recheck performs one lookup by default; add `--wait 600` to wait up to ten minutes
-for a missing SB number. An existing saved table is displayed without a network lookup.
+for a missing SB or BE number. An existing saved table is displayed without a network lookup.
 
 To choose a recent completed run interactively, use `upload "FILE_PATH" --ls`.
 Here `FILE_PATH` is the working folder or its `Done` folder. The picker lists runs
 newest first with their file names; selecting one rechecks it and copies the table.
-Use `--table sb` or `--table esanchit` to select which table to copy.
+Use `--table sb`, `--table be` or `--table esanchit` to select which table to copy.
 
-For an `.sb` file the customs location is read from the file itself (the first field of its
-`<TABLE>SB` record); there is no option for it. If the files name different locations or none can be read, the run stops before anything is sent. The SB lookup also uses the job number and date in that record, regardless of the filename. BE files are uploaded but do not have an SB-number draft. `--dry-run` lists signed and unsigned files and guessed codes without signing or uploading. If a run
+For an `.sb` or `.be` file the customs location is read from the file itself (the first field of its
+`<TABLE>SB` or `<TABLE>BE` record); there is no option for it. If the files name different locations or none can be read, the run stops before anything is sent. The SB lookup also uses the job number and date in that record, regardless of the filename. A BE file whose location or job cannot be read is still uploaded, but gets no BE-number check. `--dry-run` lists signed and unsigned files and guessed codes without signing or uploading. If a run
 stops after an upload, check the portal and mail before trying again.
 
 | Piece | Owns | Never does |

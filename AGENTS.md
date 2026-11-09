@@ -69,6 +69,7 @@ hashes. Staging is ephemeral: the row lives in the current eSANCHIT
 | `src/icegate_client/filing/client.py` | signed SB/BE filing upload and per-file receipts |
 | `src/icegate_client/ecopy.py` | read-only Shipping Bill, Bill of Entry and gatepass searches and downloads |
 | `src/icegate_client/jobstatus.py` | read-only Shipping Bill Job Status detailed report |
+| `src/icegate_client/notifications.py` | read-only dashboard notifications; parses filing outcomes (submitted, rejected, validation failed) |
 | `src/icegate_client/myiec.py` | read-only My IEC client list |
 | `src/icegate_client/enquiry.py` | public Shipping Bill enquiry, no login |
 | `scripts/icegate-run.py` | personal one-folder workflow: sign, upload via the CLI gates, draft, archive |
@@ -97,6 +98,16 @@ record when searched for 27–28 October. `downloadUrl` is a portal filename,
 not necessarily a complete URL.
 
 Read-only reports (observed 2026-10-30, live-tested):
+- Notifications (observed 2026-11-09): `POST /registration/getNotifications/all` with
+  `{icegateId, notificationType: "E", roleId}` returns every notification, newest first, with only a
+  `createdDate` (DD.MM.YYYY, no time). Never call `getNotifications/read`: it marks them read. Filing
+  outcomes: "`... filing with job no. N dated D has been successfully submitted`" (accepted for processing,
+  not final), "`... has been rejected. Error code: ...`", and "`Header|Field|DSC validation failed for control
+  no. N, filing date D, Receiver ID LOC`". D is YYYYMMDD, DDMMYYYY or YYYY-MM-DD. "`... with be no. / sb no. N`"
+  and "`generated with BE/SB number N`" carry the document number, not the job. Job numbers repeat, so
+  `icegate-run.py` judges a job only by notices that appear after its baseline taken before the upload.
+  A rejected or failed job ends the wait for its SB/BE number; BE numbers come from `ecopy search BE` by job
+  (`docDate` can be `-`). A BE job keeps the date in the file; a refiled BE can carry a different job date.
 - Gatepass (SB35) is an e-copy kind: `documentType: "LEOGate"` on the same
   `searchByDate`/`searchByJobNumber` calls; CLI kind `GATEPASS`. The list holds the
   same bills as SB; records without `irn`/`userId` have no gatepass yet. Download is
@@ -261,6 +272,8 @@ and receipt path; a filing 202 is not final, the filing-status email decides.
   JPEG quality) to leave an estimated allowance for signing; actual signed size can vary. If no profile fits,
   preparation stops. Existing signed files are preserved. Flattening loses selectable text. A portal refusal
   stops the run like any other exit 1; there is no retry.
+- After a filing upload it looks up the SB/BE number by job (`ecopy search`) and reads notifications each round;
+  a rejection ends that job's wait. It never reads notifications as 'read' and never resubmits.
 - The script owns only: the prompts and tables (questionary and rich, declared in its own header, not
   client dependencies), choosing codes from `document_codes.txt` (the user picks per
   file, the guess pre-selected; no terminal means only an unambiguous code), the reply
